@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dra-xsk-driver
+  namespace: kube-system
+  labels:
+    app: dra-xsk-driver
+spec:
+  selector:
+    matchLabels:
+      app: dra-xsk-driver
+  template:
+    metadata:
+      labels:
+        app: dra-xsk-driver
+    spec:
+      hostNetwork: true
+      priorityClassName: system-node-critical
+
+      # IEC 61850 nodes must be labelled:
+      #   iec61850.io/xdp-capable: "true"
+      # groutx must already be running on the node (manages the XDP pipeline).
+      nodeSelector:
+        iec61850.io/xdp-capable: "true"
+
+      serviceAccountName: dra-xsk-driver
+
+      containers:
+        - name: driver
+          image: quay.io/fabiendupont/dra-xsk-driver:latest
+          command:
+            - /usr/bin/dra-xsk
+          args:
+            - --node-name=$(NODE_NAME)
+            - --driver-name=xsk.iec61850.io
+            - --groutx-socket=/run/groutx.sock
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            # No CAP_NET_ADMIN or CAP_BPF required — groutx handles XDP loading.
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: plugin-socket-dir
+              mountPath: /var/lib/kubelet/plugins/xsk.iec61850.io
+            - name: cdi-dir
+              mountPath: /etc/cdi
+            - name: groutx-socket
+              mountPath: /run/groutx.sock
+
+      volumes:
+        - name: plugin-socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/xsk.iec61850.io
+            type: DirectoryOrCreate
+        - name: cdi-dir
+          hostPath:
+            path: /etc/cdi
+            type: DirectoryOrCreate
+        - name: groutx-socket
+          hostPath:
+            path: /run/groutx.sock
+            type: Socket
