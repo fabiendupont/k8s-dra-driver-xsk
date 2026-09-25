@@ -117,23 +117,16 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 			return errResp("allocating queue %s: %v", q.ID, err)
 		}
 
-		// Build XskAddReq for groutx.
-		// NOTE: XskAddReq/XskFilter fields are currently generated as uint8 because
-		// the generator does not yet handle kernel __u32/__u16 types or nested struct
-		// arrays. The Ifname and Filters fields are absent from the generated struct.
-		// This will be corrected when the generator is extended; for now the call
-		// demonstrates the correct architecture. Ifname and queue_id are passed
-		// via the QueueId and NFilters fields as a placeholder.
+		// Build XskAddReq: register GOOSE (0x88B8) and SV (0x88BA) filters.
 		xskReq := &groutx.XskAddReq{
-			// TODO: set Ifname [16]byte, QueueId uint32, Filters [8]XskFilter
-			// once the generator correctly handles __u32 and char[N] fields.
+			QueueId:  uint32(q.QueueID),
 			NFilters: 2,
+			Filters: [8]groutx.XskFilter{
+				{Ethertype: ethertypeGOOSE},
+				{Ethertype: ethertypeSV},
+			},
 		}
-		// Store ifname and queue_id in the padding field as a workaround.
-		// Real encoding will be correct after generator fix.
-		_ = q.Ifname
-		_ = ethertypeGOOSE
-		_ = ethertypeSV
+		copy(xskReq.Ifname[:], q.Ifname)
 
 		xskResp, err := d.groutxc.XskAdd(ctx, xskReq)
 		if err != nil {
@@ -144,7 +137,9 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 		sockPath := strings.TrimRight(string(xskResp.SocketPath[:]), "\x00")
 
 		if err := WriteCDISpec(d.cdiDir, q.ID, q.Ifname, q.QueueID, sockPath); err != nil {
-			_ = d.groutxc.XskDel(ctx, &groutx.XskDelReq{})
+			delReq := &groutx.XskDelReq{QueueId: uint32(q.QueueID)}
+			copy(delReq.Ifname[:], q.Ifname)
+			_ = d.groutxc.XskDel(ctx, delReq)
 			d.state.ReleaseByClaimUID(claim.Uid)
 			return errResp("writing CDI spec for %s: %v", q.ID, err)
 		}
@@ -184,10 +179,8 @@ func (d *Driver) unprepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.
 	for _, queueID := range released {
 		ifname, qid, err := parseQueueID(queueID)
 		if err == nil {
-			delReq := &groutx.XskDelReq{}
-			// TODO: set Ifname and QueueId once generator handles __u32/char[N].
-			_ = ifname
-			_ = qid
+			delReq := &groutx.XskDelReq{QueueId: uint32(qid)}
+			copy(delReq.Ifname[:], ifname)
 			if err := d.groutxc.XskDel(ctx, delReq); err != nil {
 				klog.ErrorS(err, "XskDel via groutx", "queue", queueID)
 			}
