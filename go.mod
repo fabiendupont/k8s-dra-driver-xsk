@@ -3,7 +3,7 @@ module github.com/fabiendupont/k8s-dra-driver-xsk
 go 1.26.0
 
 require (
-	github.com/fabiendupont/groutx-go v0.0.0
+	github.com/fabiendupont/groutx-go v0.1.0
 	google.golang.org/grpc v1.83.2
 	k8s.io/api v0.37.0
 	k8s.io/apimachinery v0.37.0
@@ -57,5 +57,3 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.2 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
-
-replace github.com/fabiendupont/groutx-go => /home/fdupont/Code/github.com/fabiendupont/xdp-grout/go
