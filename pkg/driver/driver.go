@@ -14,7 +14,6 @@ package driver
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -24,6 +23,7 @@ import (
 
 	groutx "github.com/fabiendupont/groutx-go"
 
+	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/xglcheck"
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/xsk"
 )
 
@@ -36,26 +36,30 @@ const (
 // Driver implements drav1.DRAPluginServer.
 type Driver struct {
 	drav1.UnimplementedDRAPluginServer
-	driverName string
-	nodeName   string
-	cdiDir     string
-	client     kubernetes.Interface
-	groutxc    *groutx.Client
-	state      *AllocationState
-	publisher  *SlicePublisher
+	driverName   string
+	nodeName     string
+	cdiDir       string
+	client       kubernetes.Interface
+	groutxc      *groutx.Client
+	state        *AllocationState
+	publisher    *SlicePublisher
+	xglCheckBin  string
 }
 
 // NewDriver creates a new DRA XSK driver instance.
 // groutxSocket is the path to the groutx daemon Unix socket (e.g. /run/groutx.sock).
-func NewDriver(driverName, nodeName, cdiDir, groutxSocket string, client kubernetes.Interface) *Driver {
+// xglCheckBin is the path to the xgl_check binary (xdp-graph-lib);
+// empty disables the deterministic validation gate.
+func NewDriver(driverName, nodeName, cdiDir, groutxSocket, xglCheckBin string, client kubernetes.Interface) *Driver {
 	return &Driver{
-		driverName: driverName,
-		nodeName:   nodeName,
-		cdiDir:     cdiDir,
-		client:     client,
-		groutxc:    groutx.NewClient(groutxSocket),
-		state:      NewAllocationState(),
-		publisher:  NewSlicePublisher(client, driverName, nodeName),
+		driverName:  driverName,
+		nodeName:    nodeName,
+		cdiDir:      cdiDir,
+		client:      client,
+		groutxc:     groutx.NewClient(groutxSocket),
+		state:       NewAllocationState(),
+		publisher:   NewSlicePublisher(client, driverName, nodeName),
+		xglCheckBin: xglCheckBin,
 	}
 }
 
@@ -97,8 +101,41 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 		return errResp("discovering NIC queues: %v", err)
 	}
 	queueByID := make(map[string]*xsk.Queue, len(allQueues))
+	nQueuesByIf := make(map[string]int)
 	for _, q := range allQueues {
 		queueByID[q.ID] = q
+		if q.QueueID+1 > nQueuesByIf[q.Ifname] {
+			nQueuesByIf[q.Ifname] = q.QueueID + 1
+		}
+	}
+
+	// Collect the candidate allocations for this claim first: the
+	// deterministic validation gate must see the entire intended
+	// graph (existing + candidate) before anything is created.
+	var candidates []*Allocation
+	for _, result := range rc.Status.Allocation.Devices.Results {
+		if result.Driver != d.driverName || result.Pool != d.nodeName {
+			continue
+		}
+		q, ok := queueByID[result.Device]
+		if !ok {
+			return errResp("unknown device %s in claim %s", result.Device, claim.Uid)
+		}
+		candidates = append(candidates, &Allocation{
+			ClaimUID:   claim.Uid,
+			Ifname:     q.Ifname,
+			QueueID:    q.QueueID,
+			NQueues:    nQueuesByIf[q.Ifname],
+			NUMANode:   q.NUMANode,
+			Ethertypes: []uint16{ethertypeGOOSE, ethertypeSV},
+		})
+	}
+	if len(candidates) == 0 {
+		return errResp("no XSK devices found in claim %s", claim.Uid)
+	}
+
+	if err := d.validateGraph(candidates); err != nil {
+		return errResp("graph validation failed for claim %s: %v", claim.Uid, err)
 	}
 
 	var devices []*drav1.Device
@@ -113,7 +150,14 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 			return errResp("unknown device %s in claim %s", result.Device, claim.Uid)
 		}
 
-		if err := d.state.Allocate(q.ID, claim.Uid); err != nil {
+		if err := d.state.Allocate(&Allocation{
+			ClaimUID:   claim.Uid,
+			Ifname:     q.Ifname,
+			QueueID:    q.QueueID,
+			NQueues:    nQueuesByIf[q.Ifname],
+			NUMANode:   q.NUMANode,
+			Ethertypes: []uint16{ethertypeGOOSE, ethertypeSV},
+		}); err != nil {
 			return errResp("allocating queue %s: %v", q.ID, err)
 		}
 
@@ -176,31 +220,53 @@ func (d *Driver) NodeUnprepareResources(ctx context.Context, req *drav1.NodeUnpr
 func (d *Driver) unprepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.NodeUnprepareResourceResponse {
 	released := d.state.ReleaseByClaimUID(claim.Uid)
 
-	for _, queueID := range released {
-		ifname, qid, err := parseQueueID(queueID)
-		if err == nil {
-			delReq := &groutx.XskDelReq{QueueId: uint32(qid)}
-			copy(delReq.Ifname[:], ifname)
-			if err := d.groutxc.XskDel(ctx, delReq); err != nil {
-				klog.ErrorS(err, "XskDel via groutx", "queue", queueID)
-			}
+	for _, a := range released {
+		delReq := &groutx.XskDelReq{QueueId: uint32(a.QueueID)}
+		copy(delReq.Ifname[:], a.Ifname)
+		if err := d.groutxc.XskDel(ctx, delReq); err != nil {
+			klog.ErrorS(err, "XskDel via groutx", "queue", queueKey(a.Ifname, a.QueueID))
 		}
-		RemoveCDISpec(d.cdiDir, queueID)
+		RemoveCDISpec(d.cdiDir, queueKey(a.Ifname, a.QueueID))
 	}
 
-	klog.InfoS("Unprepared XSK claim", "claim", claim.Uid, "queues", released)
+	klog.InfoS("Unprepared XSK claim", "claim", claim.Uid,
+		"queues", len(released))
 	return &drav1.NodeUnprepareResourceResponse{}
 }
 
-// parseQueueID splits a queue ID like "eth0-queue0" into ifname "eth0" and queue index 0.
-func parseQueueID(id string) (ifname string, queueID int, err error) {
-	idx := strings.LastIndex(id, "-queue")
-	if idx < 0 {
-		return "", 0, fmt.Errorf("invalid queue ID: %s", id)
+// validateGraph runs the deterministic xgl_check gate over the
+// intended state: all existing allocations plus the candidates.
+// It is a no-op when no xgl_check binary is configured.
+func (d *Driver) validateGraph(candidates []*Allocation) error {
+	if d.xglCheckBin == "" {
+		return nil
 	}
-	ifname = id[:idx]
-	queueID, err = strconv.Atoi(id[idx+len("-queue"):])
-	return
+
+	combined := append(d.state.Snapshot(), candidates...)
+	spec := buildSpec(d.nodeName, combined)
+
+	findings, err := xglcheck.Validate(spec, d.xglCheckBin)
+	if err != nil {
+		// A check that cannot run fails closed: the gate is only a
+		// gate if it actually runs.
+		return fmt.Errorf("running xgl_check: %w", err)
+	}
+
+	for _, f := range findings {
+		klog.InfoS("xgl_check finding", "severity", f.Severity,
+			"code", f.Code, "message", f.Message)
+	}
+
+	if xglcheck.HasErrors(findings) {
+		var errs []string
+		for _, f := range findings {
+			if f.IsError() {
+				errs = append(errs, f.String())
+			}
+		}
+		return fmt.Errorf("invalid graph spec: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 func errResp(format string, args ...any) *drav1.NodePrepareResourceResponse {

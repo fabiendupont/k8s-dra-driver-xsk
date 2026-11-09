@@ -28,6 +28,7 @@ var (
 	pluginSock   = flag.String("plugin-socket", "/var/lib/kubelet/plugins/xsk.iec61850.io/plugin.sock", "kubelet DRA plugin socket path")
 	cdiDir       = flag.String("cdi-dir", driver.CDIDir, "CDI spec directory")
 	groutxSocket = flag.String("groutx-socket", "/run/groutx.sock", "groutx daemon Unix socket path")
+	xglCheckBin  = flag.String("xgl-check-bin", os.Getenv("XGL_CHECK_BIN"), "xgl_check binary path (xdp-graph-lib); empty disables the graph validation gate")
 )
 
 func main() {
@@ -55,7 +56,7 @@ func main() {
 		os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	d := driver.NewDriver(*driverName, *nodeName, *cdiDir, *groutxSocket, client)
+	d := driver.NewDriver(*driverName, *nodeName, *cdiDir, *groutxSocket, *xglCheckBin, client)
 
 	if err := d.Discover(ctx); err != nil {
 		klog.Fatalf("Publishing NIC queue ResourceSlices: %v", err)
