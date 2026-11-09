@@ -21,8 +21,7 @@ import (
 	"k8s.io/klog/v2"
 	drav1 "k8s.io/kubelet/pkg/apis/dra/v1"
 
-	groutx "github.com/fabiendupont/groutx-go"
-
+	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/backend"
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/xglcheck"
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/xsk"
 )
@@ -38,23 +37,22 @@ type Driver struct {
 	nodeName     string
 	cdiDir       string
 	client       kubernetes.Interface
-	groutxc      *groutx.Client
+	backend      backend.Backend
 	state        *AllocationState
 	publisher    *SlicePublisher
 	xglCheckBin  string
 }
 
 // NewDriver creates a new DRA XSK driver instance.
-// groutxSocket is the path to the groutx daemon Unix socket (e.g. /run/groutx.sock).
 // xglCheckBin is the path to the xgl_check binary (xdp-graph-lib);
 // empty disables the deterministic validation gate.
-func NewDriver(driverName, nodeName, cdiDir, groutxSocket, xglCheckBin string, client kubernetes.Interface) *Driver {
+func NewDriver(driverName, nodeName, cdiDir string, b backend.Backend, xglCheckBin string, client kubernetes.Interface) *Driver {
 	return &Driver{
 		driverName:  driverName,
 		nodeName:    nodeName,
 		cdiDir:      cdiDir,
 		client:      client,
-		groutxc:     groutx.NewClient(groutxSocket),
+		backend:     b,
 		state:       NewAllocationState(),
 		publisher:   NewSlicePublisher(client, driverName, nodeName),
 		xglCheckBin: xglCheckBin,
@@ -175,29 +173,22 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 			return errResp("allocating queue %s: %v", q.ID, err)
 		}
 
-		// Build XskAddReq from the claim's filter set.
-		xskReq := &groutx.XskAddReq{
-			QueueId:  uint32(q.QueueID),
-			NFilters: uint8(len(ethertypes)),
-		}
-		for i, et := range ethertypes {
-			xskReq.Filters[i] = groutx.XskFilter{Ethertype: et}
-		}
-		copy(xskReq.Ifname[:], q.Ifname)
-
-		xskResp, err := d.groutxc.XskAdd(ctx, xskReq)
+		sockPath, err := d.backend.Add(ctx, &backend.Allocation{
+			Ifname:     q.Ifname,
+			Ifindex:    q.Ifindex,
+			QueueID:    q.QueueID,
+			Ethertypes: ethertypes,
+			Zerocopy:   zerocopy,
+		})
 		if err != nil {
 			d.state.ReleaseByClaimUID(claim.Uid)
-			return errResp("XskAdd for %s queue %d via groutx: %v", q.Ifname, q.QueueID, err)
+			return errResp("allocating XSK for %s queue %d via %s backend: %v",
+				q.Ifname, q.QueueID, d.backend.Name(), err)
 		}
-
-		sockPath := strings.TrimRight(string(xskResp.SocketPath[:]), "\x00")
 
 		if err := WriteCDISpec(d.cdiDir, d.driverName, q.ID, q.Ifname, q.QueueID,
 			sockPath, ethertypes); err != nil {
-			delReq := &groutx.XskDelReq{QueueId: uint32(q.QueueID)}
-			copy(delReq.Ifname[:], q.Ifname)
-			_ = d.groutxc.XskDel(ctx, delReq)
+			_ = d.backend.Del(ctx, q.Ifname, q.QueueID)
 			d.state.ReleaseByClaimUID(claim.Uid)
 			return errResp("writing CDI spec for %s: %v", q.ID, err)
 		}
@@ -209,7 +200,7 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 			CdiDeviceIds: []string{CDIDeviceID(d.driverName, q.ID)},
 		})
 
-		klog.InfoS("Prepared XSK queue via groutx", "claim", claim.Uid,
+		klog.InfoS("Prepared XSK queue", "claim", claim.Uid, "backend", d.backend.Name(),
 			"queue", q.ID, "socket", sockPath)
 	}
 
@@ -220,7 +211,7 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 	return &drav1.NodePrepareResourceResponse{Devices: devices}
 }
 
-// NodeUnprepareResources calls groutx.XskDel and removes CDI specs.
+// NodeUnprepareResources frees the XSKs and removes CDI specs.
 func (d *Driver) NodeUnprepareResources(ctx context.Context, req *drav1.NodeUnprepareResourcesRequest) (*drav1.NodeUnprepareResourcesResponse, error) {
 	resp := &drav1.NodeUnprepareResourcesResponse{
 		Claims: make(map[string]*drav1.NodeUnprepareResourceResponse),
@@ -235,10 +226,8 @@ func (d *Driver) unprepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.
 	released := d.state.ReleaseByClaimUID(claim.Uid)
 
 	for _, a := range released {
-		delReq := &groutx.XskDelReq{QueueId: uint32(a.QueueID)}
-		copy(delReq.Ifname[:], a.Ifname)
-		if err := d.groutxc.XskDel(ctx, delReq); err != nil {
-			klog.ErrorS(err, "XskDel via groutx", "queue", queueKey(a.Ifname, a.QueueID))
+		if err := d.backend.Del(ctx, a.Ifname, a.QueueID); err != nil {
+			klog.ErrorS(err, "freeing XSK", "queue", queueKey(a.Ifname, a.QueueID))
 		}
 		RemoveCDISpec(d.cdiDir, d.driverName, queueKey(a.Ifname, a.QueueID))
 	}

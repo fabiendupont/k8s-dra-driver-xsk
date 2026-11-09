@@ -16,14 +16,12 @@ spec:
     spec:
       hostNetwork: true
       priorityClassName: system-node-critical
-
-      # IEC 61850 nodes must be labelled:
-      #   iec61850.io/xdp-capable: "true"
-      # groutx must already be running on the node (manages the XDP pipeline).
-      nodeSelector:
-        iec61850.io/xdp-capable: "true"
-
       serviceAccountName: dra-xsk-driver
+
+      # XDP-capable nodes must be labelled:
+      #   xsk.dra.io/capable: "true"
+      nodeSelector:
+        xsk.dra.io/capable: "true"
 
       containers:
         - name: driver
@@ -33,14 +31,18 @@ spec:
           args:
             - --node-name=$(NODE_NAME)
             - --driver-name=xsk.dra.io
-            - --groutx-socket=/run/groutx.sock
+            - --handoff-dir=/run/xsk
           env:
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
           securityContext:
-            # No CAP_NET_ADMIN or CAP_BPF required — groutx handles XDP loading.
+            # The native backend loads XDP and creates AF_XDP sockets
+            # in-process: CAP_BPF + CAP_NET_ADMIN required, nothing else.
+            capabilities:
+              drop: ["ALL"]
+              add: ["CAP_BPF", "CAP_NET_ADMIN"]
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
           volumeMounts:
@@ -48,8 +50,10 @@ spec:
               mountPath: /var/lib/kubelet/plugins/xsk.dra.io
             - name: cdi-dir
               mountPath: /etc/cdi
-            - name: groutx-socket
-              mountPath: /run/groutx.sock
+            - name: handoff-dir
+              mountPath: /run/xsk
+            - name: sysfs-bpf
+              mountPath: /sys/fs/bpf
 
       volumes:
         - name: plugin-socket-dir
@@ -60,7 +64,11 @@ spec:
           hostPath:
             path: /etc/cdi
             type: DirectoryOrCreate
-        - name: groutx-socket
+        - name: handoff-dir
           hostPath:
-            path: /run/groutx.sock
-            type: Socket
+            path: /run/xsk
+            type: DirectoryOrCreate
+        - name: sysfs-bpf
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate

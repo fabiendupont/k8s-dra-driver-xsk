@@ -22,6 +22,7 @@ import (
 	"k8s.io/klog/v2"
 	drav1 "k8s.io/kubelet/pkg/apis/dra/v1"
 
+	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/backend/native"
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/driver"
 )
 
@@ -30,7 +31,7 @@ var (
 	nodeName     = flag.String("node-name", "", "Kubernetes node name (required)")
 	pluginSock   = flag.String("plugin-socket", "/var/lib/kubelet/plugins/xsk.dra.io/plugin.sock", "kubelet DRA plugin socket path")
 	cdiDir       = flag.String("cdi-dir", driver.CDIDir, "CDI spec directory")
-	groutxSocket = flag.String("groutx-socket", "/run/groutx.sock", "groutx daemon Unix socket path")
+	handoffDir   = flag.String("handoff-dir", "/run/xsk", "directory for per-queue SCM_RIGHTS handoff sockets")
 	xglCheckBin  = flag.String("xgl-check-bin", os.Getenv("XGL_CHECK_BIN"), "xgl_check binary path (xdp-graph-lib); empty disables the graph validation gate")
 )
 
@@ -59,7 +60,8 @@ func main() {
 		os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	d := driver.NewDriver(*driverName, *nodeName, *cdiDir, *groutxSocket, *xglCheckBin, client)
+	d := driver.NewDriver(*driverName, *nodeName, *cdiDir,
+		native.New(*handoffDir), *xglCheckBin, client)
 
 	if err := d.Discover(ctx); err != nil {
 		klog.Fatalf("Publishing NIC queue ResourceSlices: %v", err)

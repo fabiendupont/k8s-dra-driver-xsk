@@ -17,6 +17,9 @@ type Queue struct {
 	// Ifname is the network interface name.
 	Ifname string
 
+	// Ifindex is the interface index (for XDP attach and AF_XDP bind).
+	Ifindex int
+
 	// QueueID is the NIC RX queue index.
 	QueueID int
 
@@ -73,6 +76,7 @@ func DiscoverQueues() ([]*Queue, error) {
 			queues = append(queues, &Queue{
 				ID:       fmt.Sprintf("%s-queue%d", ifname, q),
 				Ifname:   ifname,
+				Ifindex:  ifindexFor(ifname),
 				QueueID:  q,
 				Driver:   driver,
 				NUMANode: numaNode,
@@ -82,6 +86,19 @@ func DiscoverQueues() ([]*Queue, error) {
 	}
 
 	return queues, nil
+}
+
+func ifindexFor(ifname string) int {
+	data, err := os.ReadFile(
+		filepath.Join("/sys/class/net", ifname, "ifindex"))
+	if err != nil {
+		return -1
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return -1
+	}
+	return n
 }
 
 func numaNodeFor(ifname string) int {
