@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/btf"
 )
 
 // TestEmbeddedSpec validates the committed bpf2go object without any
@@ -41,8 +42,8 @@ func TestEmbeddedSpec(t *testing.T) {
 	}
 
 	if et := spec.Maps["xsk_ethertypes"]; et != nil {
-		if k := et.Key.Size; k != 2 {
-			t.Errorf("ethertypes key size = %d, want 2 (__u16)", k)
+		if key, ok := et.Key.(*btf.Int); !ok || key.Size != 2 {
+			t.Errorf("ethertypes key is not __u16: %#v", et.Key)
 		}
 	}
 }
