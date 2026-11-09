@@ -1,7 +1,10 @@
 // dra-xsk — DRA kubelet plugin for AF_XDP socket allocation.
 //
-// Discovers NIC queues, publishes ResourceSlice devices, and manages
-// xsk-daemon lifecycles via NodePrepareResources / NodeUnprepareResources.
+// Discovers NIC queues, publishes ResourceSlice devices, and
+// allocates dedicated RX queues as AF_XDP sockets via
+// NodePrepareResources / NodeUnprepareResources. The EtherType
+// filter set comes from claim parameters (OpaqueDeviceConfiguration);
+// with none set, the legacy IEC 61850 preset applies.
 package main
 
 import (
@@ -23,9 +26,9 @@ import (
 )
 
 var (
-	driverName   = flag.String("driver-name", "xsk.iec61850.io", "DRA driver name")
+	driverName   = flag.String("driver-name", "xsk.dra.io", "DRA driver name")
 	nodeName     = flag.String("node-name", "", "Kubernetes node name (required)")
-	pluginSock   = flag.String("plugin-socket", "/var/lib/kubelet/plugins/xsk.iec61850.io/plugin.sock", "kubelet DRA plugin socket path")
+	pluginSock   = flag.String("plugin-socket", "/var/lib/kubelet/plugins/xsk.dra.io/plugin.sock", "kubelet DRA plugin socket path")
 	cdiDir       = flag.String("cdi-dir", driver.CDIDir, "CDI spec directory")
 	groutxSocket = flag.String("groutx-socket", "/run/groutx.sock", "groutx daemon Unix socket path")
 	xglCheckBin  = flag.String("xgl-check-bin", os.Getenv("XGL_CHECK_BIN"), "xgl_check binary path (xdp-graph-lib); empty disables the graph validation gate")

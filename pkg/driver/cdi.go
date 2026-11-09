@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"k8s.io/klog/v2"
 )
@@ -13,7 +14,6 @@ import (
 // It is used to bind-mount the socket's parent directory into the container.
 
 const (
-	cdiVendor  = "xsk.iec61850.io"
 	cdiClass   = "queue"
 	cdiVersion = "0.6.0"
 
@@ -45,29 +45,36 @@ type cdiMount struct {
 }
 
 // CDIDeviceID returns the CDI device ID for a NIC queue.
-// Example: "xsk.iec61850.io/queue=eth0-queue0"
-func CDIDeviceID(queueID string) string {
-	return cdiVendor + "/" + cdiClass + "=" + queueID
+// Example: "xsk.dra.io/queue=eth0-queue0"
+func CDIDeviceID(driverName, queueID string) string {
+	return driverName + "/" + cdiClass + "=" + queueID
 }
 
 // WriteCDISpec writes a CDI spec for the allocated queue so the container
-// runtime injects IEC61850_XSK_SOCKET and mounts the socket directory.
-func WriteCDISpec(cdiDir, queueID, ifname string, queueIdx int, sockPath string) error {
+// runtime injects XSK_SOCKET and mounts the socket directory.
+func WriteCDISpec(cdiDir, driverName, queueID, ifname string, queueIdx int,
+	sockPath string, ethertypes []uint16) error {
 	if err := os.MkdirAll(cdiDir, 0755); err != nil {
 		return fmt.Errorf("creating CDI dir: %w", err)
 	}
 
+	etList := make([]string, len(ethertypes))
+	for i, et := range ethertypes {
+		etList[i] = fmt.Sprintf("%#04x", et)
+	}
+
 	spec := cdiSpec{
 		CDIVersion: cdiVersion,
-		Kind:       cdiVendor + "/" + cdiClass,
+		Kind:       driverName + "/" + cdiClass,
 		Devices: []cdiDevice{
 			{
 				Name: queueID,
 				ContainerEdits: cdiContainerEdit{
 					Env: []string{
-						fmt.Sprintf("IEC61850_XSK_SOCKET=%s", sockPath),
-						fmt.Sprintf("IEC61850_XSK_IFACE=%s", ifname),
-						fmt.Sprintf("IEC61850_XSK_QUEUE=%d", queueIdx),
+						fmt.Sprintf("XSK_SOCKET=%s", sockPath),
+						fmt.Sprintf("XSK_IFACE=%s", ifname),
+						fmt.Sprintf("XSK_QUEUE=%d", queueIdx),
+						fmt.Sprintf("XSK_ETHTYPES=%s", strings.Join(etList, ",")),
 					},
 					Mounts: []cdiMount{
 						{
@@ -81,7 +88,7 @@ func WriteCDISpec(cdiDir, queueID, ifname string, queueIdx int, sockPath string)
 		},
 	}
 
-	specPath := cdiSpecPath(cdiDir, queueID)
+	specPath := cdiSpecPath(cdiDir, driverName, queueID)
 	data, err := json.MarshalIndent(spec, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling CDI spec: %w", err)
@@ -95,13 +102,13 @@ func WriteCDISpec(cdiDir, queueID, ifname string, queueIdx int, sockPath string)
 }
 
 // RemoveCDISpec deletes the CDI spec for a queue.
-func RemoveCDISpec(cdiDir, queueID string) {
-	specPath := cdiSpecPath(cdiDir, queueID)
+func RemoveCDISpec(cdiDir, driverName, queueID string) {
+	specPath := cdiSpecPath(cdiDir, driverName, queueID)
 	if err := os.Remove(specPath); err != nil && !os.IsNotExist(err) {
 		klog.ErrorS(err, "Removing CDI spec", "path", specPath)
 	}
 }
 
-func cdiSpecPath(cdiDir, queueID string) string {
-	return filepath.Join(cdiDir, cdiVendor+"-"+cdiClass+"-"+queueID+".json")
+func cdiSpecPath(cdiDir, driverName, queueID string) string {
+	return filepath.Join(cdiDir, driverName+"-"+cdiClass+"-"+queueID+".json")
 }

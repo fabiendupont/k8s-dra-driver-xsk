@@ -14,6 +14,7 @@ type Allocation struct {
 	NQueues     int
 	NUMANode    int
 	Ethertypes  []uint16
+	Zerocopy    bool
 }
 
 // AllocationState tracks which NIC queues are allocated to which ResourceClaims.

@@ -32,7 +32,7 @@ spec:
             - /usr/bin/dra-xsk
           args:
             - --node-name=$(NODE_NAME)
-            - --driver-name=xsk.iec61850.io
+            - --driver-name=xsk.dra.io
             - --groutx-socket=/run/groutx.sock
           env:
             - name: NODE_NAME
@@ -45,7 +45,7 @@ spec:
             readOnlyRootFilesystem: true
           volumeMounts:
             - name: plugin-socket-dir
-              mountPath: /var/lib/kubelet/plugins/xsk.iec61850.io
+              mountPath: /var/lib/kubelet/plugins/xsk.dra.io
             - name: cdi-dir
               mountPath: /etc/cdi
             - name: groutx-socket
@@ -54,7 +54,7 @@ spec:
       volumes:
         - name: plugin-socket-dir
           hostPath:
-            path: /var/lib/kubelet/plugins/xsk.iec61850.io
+            path: /var/lib/kubelet/plugins/xsk.dra.io
             type: DirectoryOrCreate
         - name: cdi-dir
           hostPath:

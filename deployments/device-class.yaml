@@ -1,8 +1,29 @@
+# Generic XSK class: EtherType filters come from the claim's
+# parameters (see examples/claim-generic.yaml).
 apiVersion: resource.k8s.io/v1
 kind: DeviceClass
 metadata:
-  name: xsk.iec61850.io
+  name: xsk
 spec:
   selectors:
     - cel:
-        expression: device.driver == "xsk.iec61850.io"
+        expression: device.driver == "xsk.dra.io"
+---
+# IEC 61850 preset: claims via this class get GOOSE + SV filters by
+# default; claim-level parameters still override the class config.
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: xsk-iec61850
+spec:
+  selectors:
+    - cel:
+        expression: device.driver == "xsk.dra.io"
+  config:
+    - deviceConfiguration:
+        opaque:
+          driver: xsk.dra.io
+          parameters:
+            apiVersion: xsk.dra.io/v1alpha1
+            kind: XSKParameters
+            ethertypes: ["0x88B8", "0x88BA"]

@@ -27,11 +27,9 @@ import (
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/xsk"
 )
 
-// EtherType constants for IEC 61850 protocols.
-const (
-	ethertypeGOOSE uint16 = 0x88B8
-	ethertypeSV    uint16 = 0x88BA
-)
+// EtherType constants for the legacy IEC 61850 preset are in
+// params.go (defaultEthertypes); the driver itself is
+// protocol-neutral and takes its filter set from claim parameters.
 
 // Driver implements drav1.DRAPluginServer.
 type Driver struct {
@@ -109,6 +107,20 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 		}
 	}
 
+	// Per-claim parameters: EtherType filter set and zero-copy mode.
+	requestNames := make([]string, 0, len(rc.Status.Allocation.Devices.Results))
+	for _, result := range rc.Status.Allocation.Devices.Results {
+		requestNames = append(requestNames, result.Request)
+	}
+	params, err := paramsFromClaim(rc, d.driverName, requestNames)
+	if err != nil {
+		return errResp("parsing parameters for claim %s: %v", claim.Uid, err)
+	}
+	ethertypes, zerocopy, err := params.Resolve()
+	if err != nil {
+		return errResp("invalid parameters for claim %s: %v", claim.Uid, err)
+	}
+
 	// Collect the candidate allocations for this claim first: the
 	// deterministic validation gate must see the entire intended
 	// graph (existing + candidate) before anything is created.
@@ -127,7 +139,8 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 			QueueID:    q.QueueID,
 			NQueues:    nQueuesByIf[q.Ifname],
 			NUMANode:   q.NUMANode,
-			Ethertypes: []uint16{ethertypeGOOSE, ethertypeSV},
+			Ethertypes: ethertypes,
+			Zerocopy:   zerocopy,
 		})
 	}
 	if len(candidates) == 0 {
@@ -156,19 +169,19 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 			QueueID:    q.QueueID,
 			NQueues:    nQueuesByIf[q.Ifname],
 			NUMANode:   q.NUMANode,
-			Ethertypes: []uint16{ethertypeGOOSE, ethertypeSV},
+			Ethertypes: ethertypes,
+			Zerocopy:   zerocopy,
 		}); err != nil {
 			return errResp("allocating queue %s: %v", q.ID, err)
 		}
 
-		// Build XskAddReq: register GOOSE (0x88B8) and SV (0x88BA) filters.
+		// Build XskAddReq from the claim's filter set.
 		xskReq := &groutx.XskAddReq{
 			QueueId:  uint32(q.QueueID),
-			NFilters: 2,
-			Filters: [8]groutx.XskFilter{
-				{Ethertype: ethertypeGOOSE},
-				{Ethertype: ethertypeSV},
-			},
+			NFilters: uint8(len(ethertypes)),
+		}
+		for i, et := range ethertypes {
+			xskReq.Filters[i] = groutx.XskFilter{Ethertype: et}
 		}
 		copy(xskReq.Ifname[:], q.Ifname)
 
@@ -180,7 +193,8 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 
 		sockPath := strings.TrimRight(string(xskResp.SocketPath[:]), "\x00")
 
-		if err := WriteCDISpec(d.cdiDir, q.ID, q.Ifname, q.QueueID, sockPath); err != nil {
+		if err := WriteCDISpec(d.cdiDir, d.driverName, q.ID, q.Ifname, q.QueueID,
+			sockPath, ethertypes); err != nil {
 			delReq := &groutx.XskDelReq{QueueId: uint32(q.QueueID)}
 			copy(delReq.Ifname[:], q.Ifname)
 			_ = d.groutxc.XskDel(ctx, delReq)
@@ -192,7 +206,7 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 			RequestNames: []string{result.Request},
 			PoolName:     result.Pool,
 			DeviceName:   result.Device,
-			CdiDeviceIds: []string{CDIDeviceID(q.ID)},
+			CdiDeviceIds: []string{CDIDeviceID(d.driverName, q.ID)},
 		})
 
 		klog.InfoS("Prepared XSK queue via groutx", "claim", claim.Uid,
@@ -226,7 +240,7 @@ func (d *Driver) unprepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.
 		if err := d.groutxc.XskDel(ctx, delReq); err != nil {
 			klog.ErrorS(err, "XskDel via groutx", "queue", queueKey(a.Ifname, a.QueueID))
 		}
-		RemoveCDISpec(d.cdiDir, queueKey(a.Ifname, a.QueueID))
+		RemoveCDISpec(d.cdiDir, d.driverName, queueKey(a.Ifname, a.QueueID))
 	}
 
 	klog.InfoS("Unprepared XSK claim", "claim", claim.Uid,

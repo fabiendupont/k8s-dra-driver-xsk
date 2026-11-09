@@ -33,7 +33,7 @@ func buildSpec(nodeName string, allocations []*Allocation) *xglcheck.Spec {
 		spec.Edges = append(spec.Edges, xglcheck.Edge{From: 0, To: nodeIdx})
 
 		x := xglcheck.NewXSK(a.Ifname, a.QueueID, a.NQueues)
-		x.Zerocopy = true
+		x.Zerocopy = a.Zerocopy
 		if a.NUMANode >= 0 {
 			x.NUMANode = a.NUMANode
 		}

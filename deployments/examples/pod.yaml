@@ -1,0 +1,23 @@
+# Pod consuming an XSK claim. The CDI device injects:
+#   XSK_SOCKET   - Unix socket path for the AF_XDP fd handoff
+#   XSK_IFACE    - network interface name
+#   XSK_QUEUE    - RX queue index
+#   XSK_ETHTYPES - comma-separated filter set (e.g. "0x88b8,0x88ba")
+apiVersion: v1
+kind: Pod
+metadata:
+  name: xsk-consumer
+spec:
+  containers:
+    - name: app
+      image: registry.example.com/xsk-app:latest
+      command: ["/app/xsk-consumer"]
+      env:
+        - name: CLAIM
+          value: xsk-generic
+      resources:
+        claims:
+          - name: xsk
+  resourceClaims:
+    - name: xsk
+      resourceClaimName: xsk-generic

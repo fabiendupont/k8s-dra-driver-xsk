@@ -1,0 +1,23 @@
+# Generic claim: explicit EtherType filters (e.g. PROFINET DCP 0x8892
+# and EtherCAT 0x88A4 on one queue).
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: xsk-generic
+spec:
+  devices:
+    requests:
+      - name: queue
+        exactly:
+          deviceClassName: xsk
+          count: 1
+    config:
+      - requests: ["queue"]
+        deviceConfiguration:
+          opaque:
+            driver: xsk.dra.io
+            parameters:
+              apiVersion: xsk.dra.io/v1alpha1
+              kind: XSKParameters
+              ethertypes: ["0x8892", "0x88A4"]
+              zerocopy: true

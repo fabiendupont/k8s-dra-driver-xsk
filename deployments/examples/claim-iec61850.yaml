@@ -1,0 +1,14 @@
+# IEC 61850 claim via the preset class: GOOSE (0x88B8) + SV (0x88BA)
+# come from the xsk-iec61850 DeviceClass config — no claim parameters
+# needed.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: xsk-iec61850
+spec:
+  devices:
+    requests:
+      - name: queue
+        exactly:
+          deviceClassName: xsk-iec61850
+          count: 1
