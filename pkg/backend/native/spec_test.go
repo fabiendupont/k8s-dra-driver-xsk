@@ -42,8 +42,8 @@ func TestEmbeddedSpec(t *testing.T) {
 	}
 
 	if et := spec.Maps["xsk_ethertypes"]; et != nil {
-		if key, ok := et.Key.(*btf.Int); !ok || key.Size != 2 {
-			t.Errorf("ethertypes key is not __u16: %#v", et.Key)
+		if size, err := btf.Sizeof(et.Key); err != nil || size != 2 {
+			t.Errorf("ethertypes key size = %d (err %v), want 2 (__u16)", size, err)
 		}
 	}
 }
