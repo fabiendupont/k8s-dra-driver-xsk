@@ -62,15 +62,31 @@ type Filter struct {
 	Ethertype uint16
 }
 
+// Exit is a named tail-call exit declared by a node
+// (XGL_EXIT_TAG / .xgl.exits).
+type Exit struct {
+	Prog     string
+	ExitName string
+}
+
+// Binding is a composition-time binding: exit -> PROG_ARRAY slot.
+type Binding struct {
+	Prog     string
+	ExitName string
+	Slot     int
+}
+
 // Spec is the declarative description of the intended graph.
 type Spec struct {
-	Name       string
-	MaxNodes   int
-	RootIndex  int
-	Nodes      []Node
-	Edges      []Edge
-	XSKs       []XSK
-	Filters    []Filter
+	Name      string
+	MaxNodes  int
+	RootIndex int
+	Nodes     []Node
+	Edges     []Edge
+	XSKs      []XSK
+	Filters   []Filter
+	Exits     []Exit
+	Bindings  []Binding
 }
 
 const (
@@ -131,6 +147,20 @@ func (s *Spec) Render() (string, error) {
 			return "", fmt.Errorf("ifname %q longer than %d chars", f.Ifname, maxIfnameLen)
 		}
 		fmt.Fprintf(&b, "filter %s %d 0x%04X\n", f.Ifname, f.QueueID, f.Ethertype)
+	}
+
+	for _, e := range s.Exits {
+		if len(e.Prog) > maxNameLen || len(e.ExitName) > maxNameLen {
+			return "", fmt.Errorf("exit name too long: %s/%s", e.Prog, e.ExitName)
+		}
+		fmt.Fprintf(&b, "exit %s %s\n", e.Prog, e.ExitName)
+	}
+
+	for _, bd := range s.Bindings {
+		if len(bd.Prog) > maxNameLen || len(bd.ExitName) > maxNameLen {
+			return "", fmt.Errorf("binding name too long: %s/%s", bd.Prog, bd.ExitName)
+		}
+		fmt.Fprintf(&b, "bind %s %s %d\n", bd.Prog, bd.ExitName, bd.Slot)
 	}
 
 	return b.String(), nil

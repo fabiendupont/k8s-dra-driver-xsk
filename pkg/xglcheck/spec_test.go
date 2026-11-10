@@ -147,3 +147,21 @@ func TestValidate(t *testing.T) {
 		}
 	})
 }
+
+func TestRenderExitsBindings(t *testing.T) {
+	s := &Spec{
+		Name: "t", MaxNodes: 16, RootIndex: 0,
+		Nodes:  []Node{{Index: 0, Name: "dispatch"}},
+		Exits:  []Exit{{Prog: "filter", ExitName: "parse"}},
+		Bindings: []Binding{{Prog: "filter", ExitName: "parse", Slot: 2}},
+	}
+	out, err := s.Render()
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	for _, want := range []string{"exit filter parse\n", "bind filter parse 2\n"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+}
