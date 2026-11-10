@@ -15,6 +15,9 @@ type Allocation struct {
 	NUMANode    int
 	Ethertypes  []uint16
 	Zerocopy    bool
+	IRQ         int // discovered queue IRQ (-1 unknown)
+	CPU         int // dedicated CPU (-1 none)
+	CPUNumaNode int // NUMA node of CPU (-1 unknown)
 }
 
 // AllocationState tracks which NIC queues are allocated to which ResourceClaims.

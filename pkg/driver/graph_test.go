@@ -8,9 +8,11 @@ import (
 func TestBuildSpec(t *testing.T) {
 	allocs := []*Allocation{
 		{ClaimUID: "c1", Ifname: "eth0", QueueID: 0, NQueues: 8, NUMANode: 0,
-			Zerocopy: true, Ethertypes: []uint16{0x88B8, 0x88BA}},
+			Zerocopy: true, Ethertypes: []uint16{0x88B8, 0x88BA},
+			IRQ: -1, CPU: -1, CPUNumaNode: -1},
 		{ClaimUID: "c2", Ifname: "eth1", QueueID: 3, NQueues: 4, NUMANode: 1,
-			Zerocopy: true, Ethertypes: []uint16{0x88B8}},
+			Zerocopy: true, Ethertypes: []uint16{0x88B8},
+			IRQ: -1, CPU: -1, CPUNumaNode: -1},
 	}
 
 	spec := buildSpec("node1", allocs)

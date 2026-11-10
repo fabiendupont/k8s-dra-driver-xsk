@@ -39,7 +39,7 @@ func TestParamsFromClaim(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
-		ets, zc, err := p.Resolve()
+		ets, zc, _, err := p.Resolve()
 		if err != nil {
 			t.Fatalf("resolve: %v", err)
 		}
@@ -58,7 +58,7 @@ func TestParamsFromClaim(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
-		ets, _, err := p.Resolve()
+		ets, _, _, err := p.Resolve()
 		if err != nil {
 			t.Fatalf("resolve: %v", err)
 		}
@@ -73,7 +73,7 @@ func TestParamsFromClaim(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
-		ets, _, _ := p.Resolve()
+		ets, _, _, _ := p.Resolve()
 		for _, et := range ets {
 			if et == 0x0800 {
 				t.Errorf("entry scoped to other-req must not apply, got %#x", ets)
@@ -85,7 +85,7 @@ func TestParamsFromClaim(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
-		ets, _, _ = p.Resolve()
+		ets, _, _, _ = p.Resolve()
 		if len(ets) != 1 || ets[0] != 0x0800 {
 			t.Errorf("expected [0x0800], got %#x", ets)
 		}
@@ -96,7 +96,7 @@ func TestParamsFromClaim(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
-		ets, zc, err := p.Resolve()
+		ets, zc, _, err := p.Resolve()
 		if err != nil {
 			t.Fatalf("resolve: %v", err)
 		}
@@ -131,7 +131,7 @@ func TestResolveValidation(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, _, err := c.params.Resolve()
+			_, _, _, err := c.params.Resolve()
 			if (err == nil) != c.ok {
 				t.Errorf("ok=%v, err=%v", c.ok, err)
 			}
@@ -140,7 +140,7 @@ func TestResolveValidation(t *testing.T) {
 }
 
 func TestZerocopyDefault(t *testing.T) {
-	f, z, err := XSKParameters{}.Resolve()
+	f, z, _, err := XSKParameters{}.Resolve()
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -148,11 +148,34 @@ func TestZerocopyDefault(t *testing.T) {
 		t.Errorf("expected defaults, got zerocopy=%v filters=%#x", z, f)
 	}
 	noZc := false
-	_, z, err = XSKParameters{Zerocopy: &noZc}.Resolve()
+	_, z, _, err = XSKParameters{Zerocopy: &noZc}.Resolve()
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 	if z {
 		t.Error("expected zerocopy=false")
 	}
+}
+
+func TestCPUParameter(t *testing.T) {
+	t.Run("none by default", func(t *testing.T) {
+		_, _, cpu, err := XSKParameters{Ethertypes: []string{"0x88B8"}}.Resolve()
+		if err != nil || cpu != -1 {
+			t.Errorf("cpu=%d err=%v, want -1 nil", cpu, err)
+		}
+	})
+	t.Run("explicit", func(t *testing.T) {
+		cpu := 2
+		_, _, got, err := XSKParameters{Ethertypes: []string{"0x88B8"}, CPU: &cpu}.Resolve()
+		if err != nil || got != 2 {
+			t.Errorf("cpu=%d err=%v, want 2 nil", got, err)
+		}
+	})
+	t.Run("negative rejected", func(t *testing.T) {
+		cpu := -1
+		params := XSKParameters{Ethertypes: []string{"0x88B8"}, CPU: &cpu}
+		if _, _, _, err := params.Resolve(); err == nil {
+			t.Error("expected error for negative cpu")
+		}
+	})
 }

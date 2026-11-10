@@ -37,6 +37,15 @@ func buildSpec(nodeName string, allocations []*Allocation) *xglcheck.Spec {
 		if a.NUMANode >= 0 {
 			x.NUMANode = a.NUMANode
 		}
+		if a.IRQ >= 0 {
+			x.IRQ = a.IRQ
+		}
+		if a.CPU >= 0 {
+			x.CPU = a.CPU
+		}
+		if a.CPUNumaNode >= 0 {
+			x.CPUNumaNode = a.CPUNumaNode
+		}
 		spec.XSKs = append(spec.XSKs, x)
 
 		for _, et := range a.Ethertypes {

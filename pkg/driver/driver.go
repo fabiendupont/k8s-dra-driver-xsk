@@ -114,9 +114,29 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 	if err != nil {
 		return errResp("parsing parameters for claim %s: %v", claim.Uid, err)
 	}
-	ethertypes, zerocopy, err := params.Resolve()
+	ethertypes, zerocopy, dedicatedCPU, err := params.Resolve()
 	if err != nil {
 		return errResp("invalid parameters for claim %s: %v", claim.Uid, err)
+	}
+
+	// Resource-dedication data for the graph gate: discovered queue
+	// IRQs and the requested CPU's NUMA node.
+	ifnameSet := make(map[string]bool)
+	for _, q := range allQueues {
+		ifnameSet[q.Ifname] = true
+	}
+	ifnames := make([]string, 0, len(ifnameSet))
+	for ifname := range ifnameSet {
+		ifnames = append(ifnames, ifname)
+	}
+	irqs, irqErr := xsk.DiscoverIRQs(ifnames)
+	if irqErr != nil {
+		klog.ErrorS(irqErr, "discovering queue IRQs; dedication data incomplete")
+		irqs = nil
+	}
+	cpuNuma := -1
+	if dedicatedCPU >= 0 {
+		cpuNuma = xsk.CPUNumaNode(dedicatedCPU)
 	}
 
 	// Collect the candidate allocations for this claim first: the
@@ -131,14 +151,23 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 		if !ok {
 			return errResp("unknown device %s in claim %s", result.Device, claim.Uid)
 		}
+		irq := -1
+		if irqs != nil {
+			if v, ok := irqs[xsk.IRQKey{Ifname: q.Ifname, QueueID: q.QueueID}]; ok {
+				irq = v
+			}
+		}
 		candidates = append(candidates, &Allocation{
-			ClaimUID:   claim.Uid,
-			Ifname:     q.Ifname,
-			QueueID:    q.QueueID,
-			NQueues:    nQueuesByIf[q.Ifname],
-			NUMANode:   q.NUMANode,
-			Ethertypes: ethertypes,
-			Zerocopy:   zerocopy,
+			ClaimUID:    claim.Uid,
+			Ifname:      q.Ifname,
+			QueueID:     q.QueueID,
+			NQueues:     nQueuesByIf[q.Ifname],
+			NUMANode:    q.NUMANode,
+			Ethertypes:  ethertypes,
+			Zerocopy:    zerocopy,
+			IRQ:         irq,
+			CPU:         dedicatedCPU,
+			CPUNumaNode: cpuNuma,
 		})
 	}
 	if len(candidates) == 0 {
@@ -161,14 +190,23 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 			return errResp("unknown device %s in claim %s", result.Device, claim.Uid)
 		}
 
+		irq := -1
+		if irqs != nil {
+			if v, ok := irqs[xsk.IRQKey{Ifname: q.Ifname, QueueID: q.QueueID}]; ok {
+				irq = v
+			}
+		}
 		if err := d.state.Allocate(&Allocation{
-			ClaimUID:   claim.Uid,
-			Ifname:     q.Ifname,
-			QueueID:    q.QueueID,
-			NQueues:    nQueuesByIf[q.Ifname],
-			NUMANode:   q.NUMANode,
-			Ethertypes: ethertypes,
-			Zerocopy:   zerocopy,
+			ClaimUID:    claim.Uid,
+			Ifname:      q.Ifname,
+			QueueID:     q.QueueID,
+			NQueues:     nQueuesByIf[q.Ifname],
+			NUMANode:    q.NUMANode,
+			Ethertypes:  ethertypes,
+			Zerocopy:    zerocopy,
+			IRQ:         irq,
+			CPU:         dedicatedCPU,
+			CPUNumaNode: cpuNuma,
 		}); err != nil {
 			return errResp("allocating queue %s: %v", q.ID, err)
 		}

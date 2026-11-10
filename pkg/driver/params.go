@@ -27,6 +27,11 @@ type XSKParameters struct {
 	// Zerocopy requests XDP_ZEROCOPY for the AF_XDP sockets.
 	// Defaults to true.
 	Zerocopy *bool `json:"zerocopy,omitempty"`
+
+	// CPU requests a dedicated CPU core for the consuming pod
+	// (NUMA alignment with the queue is checked by the gate).
+	// Optional; -1/nil = none.
+	CPU *int `json:"cpu,omitempty"`
 }
 
 // maxFilters matches groutx XskAddReq.Filters array size.
@@ -54,21 +59,30 @@ func parseEthertype(s string) (uint16, error) {
 }
 
 // Resolve validates the parameters and returns the concrete filter
-// set and zero-copy flag, applying defaults.
-func (p XSKParameters) Resolve() ([]uint16, bool, error) {
+// set, zero-copy flag, and dedicated CPU (-1 = none), applying
+// defaults.
+func (p XSKParameters) Resolve() ([]uint16, bool, int, error) {
 	zerocopy := true
 	if p.Zerocopy != nil {
 		zerocopy = *p.Zerocopy
 	}
 
+	cpu := -1
+	if p.CPU != nil {
+		cpu = *p.CPU
+		if cpu < 0 {
+			return nil, false, -1, fmt.Errorf("cpu must be >= 0, got %d", cpu)
+		}
+	}
+
 	if len(p.Ethertypes) == 0 {
 		klog.Warning("claim carries no ethertype parameters; " +
 			"falling back to legacy IEC 61850 preset (GOOSE 0x88B8 + SV 0x88BA)")
-		return append([]uint16(nil), defaultEthertypes...), zerocopy, nil
+		return append([]uint16(nil), defaultEthertypes...), zerocopy, cpu, nil
 	}
 
 	if len(p.Ethertypes) > maxFilters {
-		return nil, false, fmt.Errorf("too many ethertypes: %d (max %d)",
+		return nil, false, -1, fmt.Errorf("too many ethertypes: %d (max %d)",
 			len(p.Ethertypes), maxFilters)
 	}
 
@@ -77,15 +91,15 @@ func (p XSKParameters) Resolve() ([]uint16, bool, error) {
 	for _, s := range p.Ethertypes {
 		v, err := parseEthertype(s)
 		if err != nil {
-			return nil, false, err
+			return nil, false, -1, err
 		}
 		if seen[v] {
-			return nil, false, fmt.Errorf("duplicate ethertype %#04x", v)
+			return nil, false, -1, fmt.Errorf("duplicate ethertype %#04x", v)
 		}
 		seen[v] = true
 		out = append(out, v)
 	}
-	return out, zerocopy, nil
+	return out, zerocopy, cpu, nil
 }
 
 // paramsFromClaim extracts this driver's parameters from a
