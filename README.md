@@ -130,9 +130,28 @@ frame's path ambiguous.
 
 ## Security
 
-- Driver pod: `CAP_BPF` + `CAP_NET_ADMIN` only (see DaemonSet)
-- Consumer pods: **zero** capabilities — fd inheritance needs none
-- The UMEM is a memfd; consumers mmap it from the received fd
+- Driver pod: root with `CAP_BPF` + `CAP_NET_ADMIN` only (see
+  DaemonSet); consuming pods: **zero** capabilities — fd inheritance
+  needs none. The UMEM is a memfd; consumers mmap it from the
+  received fd.
+
+### Why each privilege, and what can be dropped
+
+| Privilege | Needed for | Droppable? |
+|---|---|---|
+| `CAP_BPF` | XDP program + map load | Native: no (kernel requires it even with a 6.8+ BPF token, which only delegates the `CAP_SYS_ADMIN`/`CAP_NET_ADMIN` *aspects* of BPF commands). **bpfman backend: yes** — bpfman does the loading |
+| `CAP_NET_ADMIN` | XDP attach (per netns) | Native: no (BPF tokens do not cover link attach). bpfman backend: yes for loading, attach is bpfman's |
+| `CAP_SYS_RESOURCE` | MEMLOCK for BPF maps, kernels < 5.11 | **Dropped** — all supported kernels (>= 5.11) memcg-account BPF memory |
+| root (uid 0) | Kubelet plugin registration socket and CDI dir are root-owned; a non-root driver cannot write to kubelet's `plugins_registry` | Only by chowning kubelet's directories from an init container — more invasive than root with two capabilities. If your cluster runs bpfman, the driver still needs the socket, so root stays |
+
+The practical privilege floor for the native backend is
+`CAP_BPF` + `CAP_NET_ADMIN` + root-for-directories. For a
+locked-down cluster, the **bpfman backend** is the answer: bpfman
+holds the BPF and network privileges ("the daemon has the elevated
+privileges so the applications don't need to be" — the eBPF Manager
+design), leaving the driver with only the socket/CDI directory
+needs. On kernel 6.8+, cilium/ebpf also transparently uses BPF
+tokens from delegated bpffs mounts where available.
 
 ## Verification
 

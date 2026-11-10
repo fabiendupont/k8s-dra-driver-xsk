@@ -39,16 +39,19 @@ spec:
                   fieldPath: spec.nodeName
           securityContext:
             # The native backend loads XDP and creates AF_XDP sockets
-            # in-process: CAP_BPF + CAP_NET_ADMIN required. Root is
-            # CAP_SYS_RESOURCE: raise MEMLOCK for BPF maps on
-            # kernels < 5.11 (harmless elsewhere).
-            # Root is also needed to bind the kubelet plugin socket and write
-            # CDI specs into the runtime's root-owned directories
-            # (the standard posture for node DRA drivers).
+            # in-process: CAP_BPF (program/map load) + CAP_NET_ADMIN
+            # (XDP attach) required. CAP_SYS_RESOURCE is NOT needed on
+            # kernels >= 5.11 (BPF memory is memcg-accounted; the
+            # driver's memlock raise is a no-op there). Root is needed
+            # for the kubelet plugin registration socket and CDI
+            # writes into root-owned directories — the standard
+            # posture for node DRA drivers. See README (Security) for
+            # the full analysis and the bpfman-backend path to fewer
+            # privileges.
             runAsUser: 0
             capabilities:
               drop: ["ALL"]
-              add: ["CAP_BPF", "CAP_NET_ADMIN", "CAP_SYS_RESOURCE"]
+              add: ["CAP_BPF", "CAP_NET_ADMIN"]
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
           volumeMounts:
@@ -60,8 +63,6 @@ spec:
               mountPath: /etc/cdi
             - name: handoff-dir
               mountPath: /run/xsk
-            - name: sysfs-bpf
-              mountPath: /sys/fs/bpf
 
       volumes:
         - name: plugin-socket-dir
@@ -79,8 +80,4 @@ spec:
         - name: handoff-dir
           hostPath:
             path: /run/xsk
-            type: DirectoryOrCreate
-        - name: sysfs-bpf
-          hostPath:
-            path: /sys/fs/bpf
             type: DirectoryOrCreate
