@@ -39,15 +39,23 @@ spec:
                   fieldPath: spec.nodeName
           securityContext:
             # The native backend loads XDP and creates AF_XDP sockets
-            # in-process: CAP_BPF + CAP_NET_ADMIN required, nothing else.
+            # in-process: CAP_BPF + CAP_NET_ADMIN required. Root is
+            # CAP_SYS_RESOURCE: raise MEMLOCK for BPF maps on
+            # kernels < 5.11 (harmless elsewhere).
+            # Root is also needed to bind the kubelet plugin socket and write
+            # CDI specs into the runtime's root-owned directories
+            # (the standard posture for node DRA drivers).
+            runAsUser: 0
             capabilities:
               drop: ["ALL"]
-              add: ["CAP_BPF", "CAP_NET_ADMIN"]
+              add: ["CAP_BPF", "CAP_NET_ADMIN", "CAP_SYS_RESOURCE"]
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
           volumeMounts:
             - name: plugin-socket-dir
               mountPath: /var/lib/kubelet/plugins/xsk.dra.io
+            - name: plugins-registry
+              mountPath: /var/lib/kubelet/plugins_registry
             - name: cdi-dir
               mountPath: /etc/cdi
             - name: handoff-dir
@@ -59,6 +67,10 @@ spec:
         - name: plugin-socket-dir
           hostPath:
             path: /var/lib/kubelet/plugins/xsk.dra.io
+            type: DirectoryOrCreate
+        - name: plugins-registry
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
             type: DirectoryOrCreate
         - name: cdi-dir
           hostPath:

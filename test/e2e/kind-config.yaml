@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+    # The driver needs to attach XDP and create AF_XDP sockets on
+    # the node's veths; kind worker containers are privileged.
+    kubeadmConfigPatches:
+      - |
+        kind: KubeletConfiguration
+        # DRA is GA in 1.34; no feature gate needed.

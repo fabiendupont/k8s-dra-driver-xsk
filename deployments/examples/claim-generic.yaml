@@ -13,8 +13,7 @@ spec:
           count: 1
     config:
       - requests: ["queue"]
-        deviceConfiguration:
-          opaque:
+        opaque:
             driver: xsk.dra.io
             parameters:
               apiVersion: xsk.dra.io/v1alpha1

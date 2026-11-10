@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/cilium/ebpf/rlimit"
 	"google.golang.org/grpc"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/backend/native"
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/driver"
+	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/xsk"
 )
 
 var (
@@ -33,6 +35,8 @@ var (
 	cdiDir       = flag.String("cdi-dir", driver.CDIDir, "CDI spec directory")
 	handoffDir   = flag.String("handoff-dir", "/run/xsk", "directory for per-queue SCM_RIGHTS handoff sockets")
 	xglCheckBin  = flag.String("xgl-check-bin", os.Getenv("XGL_CHECK_BIN"), "xgl_check binary path (xdp-graph-lib); empty disables the graph validation gate")
+	includeVirt  = flag.Bool("include-virtual", false, "include virtual interfaces (veth) in queue discovery — development/testing only")
+	registryDir  = flag.String("plugins-registry-dir", "/var/lib/kubelet/plugins_registry", "kubelet plugins_registry directory for the registration socket")
 )
 
 func main() {
@@ -60,6 +64,17 @@ func main() {
 		os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	if *includeVirt {
+		xsk.UseVirtualInterfaces()
+	}
+
+	// BPF maps pin memory; on kernels < 5.11 this is accounted
+	// against MEMLOCK, which defaults to 64 KiB — far too small.
+	// Best effort: on 5.11+ (memcg accounting) this is a no-op.
+	if err := rlimit.RemoveMemlock(); err != nil {
+		klog.V(2).InfoS("could not remove memlock rlimit (ok on 5.11+ kernels)", "err", err)
+	}
+
 	d := driver.NewDriver(*driverName, *nodeName, *cdiDir,
 		native.New(*handoffDir), *xglCheckBin, client)
 
@@ -81,6 +96,16 @@ func main() {
 
 	srv := grpc.NewServer()
 	drav1.RegisterDRAPluginServer(srv, d)
+
+	// Kubelet plugin registration: serve the registration API on a
+	// socket in plugins_registry; the kubelet watcher discovers it,
+	// calls GetInfo, and dials the DRA endpoint above.
+	registrar := driver.NewRegistrar(*driverName, *pluginSock)
+	go func() {
+		if err := registrar.Serve(ctx, *registryDir); err != nil {
+			klog.Errorf("Plugin registration server: %v", err)
+		}
+	}()
 
 	go func() {
 		<-ctx.Done()

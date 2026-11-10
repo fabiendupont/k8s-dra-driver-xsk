@@ -43,9 +43,22 @@ var zerocopyDrivers = map[string]bool{
 	"bnxt_en":   true,
 }
 
+// includeVirtual is set by UseVirtualInterfaces (development and
+// testing only — e.g. kind clusters whose nodes expose only veths).
+var includeVirtual bool
+
+// UseVirtualInterfaces includes virtual interfaces (veth) in
+// discovery.  Development/testing only.
+func UseVirtualInterfaces() { includeVirtual = true }
+
 // DiscoverQueues enumerates all eligible NIC queues on the node.
-// It skips loopback and virtual interfaces.
+// It skips loopback and virtual interfaces (unless
+// UseVirtualInterfaces was called).
 func DiscoverQueues() ([]*Queue, error) {
+	return discoverQueues(includeVirtual)
+}
+
+func discoverQueues(includeVirtual bool) ([]*Queue, error) {
 	entries, err := os.ReadDir("/sys/class/net")
 	if err != nil {
 		return nil, fmt.Errorf("reading /sys/class/net: %w", err)
@@ -61,10 +74,15 @@ func DiscoverQueues() ([]*Queue, error) {
 		driverLink := filepath.Join("/sys/class/net", ifname, "device/driver")
 		driverTarget, err := os.Readlink(driverLink)
 		if err != nil {
-			// Virtual or software interface — skip.
-			continue
+			// Virtual or software interface.
+			if !includeVirtual {
+				continue
+			}
 		}
 		driver := filepath.Base(driverTarget)
+		if driver == "" || driver == "." {
+			driver = "virtual"
+		}
 
 		numaNode := numaNodeFor(ifname)
 		nQueues := rxQueueCount(ifname)

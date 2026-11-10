@@ -20,8 +20,7 @@ spec:
     - cel:
         expression: device.driver == "xsk.dra.io"
   config:
-    - deviceConfiguration:
-        opaque:
+    - opaque:
           driver: xsk.dra.io
           parameters:
             apiVersion: xsk.dra.io/v1alpha1
