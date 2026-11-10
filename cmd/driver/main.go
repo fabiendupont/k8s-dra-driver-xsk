@@ -23,6 +23,8 @@ import (
 	"k8s.io/klog/v2"
 	drav1 "k8s.io/kubelet/pkg/apis/dra/v1"
 
+	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/backend"
+	bpfmanbackend "github.com/fabiendupont/k8s-dra-driver-xsk/pkg/backend/bpfman"
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/backend/native"
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/driver"
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/xsk"
@@ -37,6 +39,8 @@ var (
 	xglCheckBin  = flag.String("xgl-check-bin", os.Getenv("XGL_CHECK_BIN"), "xgl_check binary path (xdp-graph-lib); empty disables the graph validation gate")
 	includeVirt  = flag.Bool("include-virtual", false, "include virtual interfaces (veth) in queue discovery — development/testing only")
 	registryDir  = flag.String("plugins-registry-dir", "/var/lib/kubelet/plugins_registry", "kubelet plugins_registry directory for the registration socket")
+	backendKind  = flag.String("backend", "native", "XSK backend: native (in-process XDP) or bpfman (delegate program loading to a bpfman daemon)")
+	bpfmanSock   = flag.String("bpfman-socket", "/run/bpfman/bpfman.sock", "bpfman daemon gRPC Unix socket path (bpfman backend)")
 )
 
 func main() {
@@ -68,6 +72,16 @@ func main() {
 		xsk.UseVirtualInterfaces()
 	}
 
+	var xskBackend backend.Backend
+	switch *backendKind {
+	case "native":
+		xskBackend = native.New(*handoffDir)
+	case "bpfman":
+		xskBackend = bpfmanbackend.New(*bpfmanSock)
+	default:
+		klog.Fatalf("unknown backend %q (native or bpfman)", *backendKind)
+	}
+
 	// BPF maps pin memory; on kernels < 5.11 this is accounted
 	// against MEMLOCK, which defaults to 64 KiB — far too small.
 	// Best effort: on 5.11+ (memcg accounting) this is a no-op.
@@ -76,7 +90,7 @@ func main() {
 	}
 
 	d := driver.NewDriver(*driverName, *nodeName, *cdiDir,
-		native.New(*handoffDir), *xglCheckBin, client)
+		xskBackend, *xglCheckBin, client)
 
 	if err := d.Discover(ctx); err != nil {
 		klog.Fatalf("Publishing NIC queue ResourceSlices: %v", err)

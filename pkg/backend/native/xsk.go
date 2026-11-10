@@ -280,6 +280,10 @@ func (r *ring) flush(fd int) {
 // Fds returns the {xsk fd, umem fd} pair for SCM_RIGHTS handoff.
 func (x *XSK) Fds() (xskFd, umemFd int) { return x.xskFd, x.umemFd }
 
+// UMemFd returns the memfd backing the UMEM (for SCM_RIGHTS
+// handoff by other backends).
+func (x *XSK) UMemFd() int { return x.umemFd }
+
 // Inherit reconstructs an XSK from the {xsk fd, umem fd} pair
 // received via SCM_RIGHTS (see ReceiveHandoff). This is the
 // consumer side — no CAP_BPF or CAP_NET_ADMIN required. The ring

@@ -25,10 +25,12 @@ type HandoffInfo struct {
 	Ethertypes []uint16 `json:"ethertypes"`
 }
 
-// handoffServer serves one XSK's fds on a Unix socket. Consumers may
+// HandoffServer serves (see StartHandoffServer). one XSK's fds on a Unix socket. Consumers may
 // connect at any time (including reconnecting after a restart) and
 // always receive the current fd pair — reconnects after Del close
 // the listener.
+// HandoffServer serves one XSK's fds on a Unix socket via
+// SCM_RIGHTS. Exported for reuse by other backends (bpfman).
 type handoffServer struct {
 	mu     sync.Mutex
 	ln     net.Listener
@@ -39,7 +41,9 @@ type handoffServer struct {
 	closed bool
 }
 
-func startHandoffServer(path string, info HandoffInfo, xskFd, umemFd int) (*handoffServer, error) {
+// StartHandoffServer starts the SCM_RIGHTS fd-handoff server for
+// one XSK at path. Exported for reuse by other backends.
+func StartHandoffServer(path string, info HandoffInfo, xskFd, umemFd int) (*HandoffServer, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, fmt.Errorf("creating handoff dir: %w", err)
 	}
@@ -51,12 +55,12 @@ func startHandoffServer(path string, info HandoffInfo, xskFd, umemFd int) (*hand
 	if err != nil {
 		return nil, fmt.Errorf("listening on %s: %w", path, err)
 	}
-	s := &handoffServer{ln: ln, path: path, info: info, xskFd: xskFd, umemFd: umemFd}
+	s := &HandoffServer{ln: ln, path: path, info: info, xskFd: xskFd, umemFd: umemFd}
 	go s.acceptLoop()
 	return s, nil
 }
 
-func (s *handoffServer) acceptLoop() {
+func (s *HandoffServer) acceptLoop() {
 	for {
 		conn, err := s.ln.Accept()
 		if err != nil {
@@ -66,7 +70,7 @@ func (s *handoffServer) acceptLoop() {
 	}
 }
 
-func (s *handoffServer) serve(conn net.Conn) {
+func (s *HandoffServer) serve(conn net.Conn) {
 	defer conn.Close()
 
 	s.mu.Lock()
@@ -96,7 +100,7 @@ func (s *handoffServer) serve(conn net.Conn) {
 	}
 }
 
-func (s *handoffServer) Close() {
+func (s *HandoffServer) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {

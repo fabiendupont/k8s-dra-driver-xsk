@@ -101,6 +101,24 @@ With no parameters, the legacy IEC 61850 preset (GOOSE + SV)
 applies. The `xsk-iec61850` DeviceClass ships the preset as class
 config.
 
+## Backends: native and bpfman
+
+The XDP loading layer is pluggable (`--backend`):
+
+- **native** (default): in-process loading via cilium/ebpf — no
+  daemon, the driver owns the XDP attach point.
+- **bpfman**: delegates program load/attach/unload to a
+  [bpfman](https://github.com/bpfman/bpfman) daemon (`--bpfman-socket`,
+  default `/run/bpfman/bpfman.sock`). bpfman's dispatcher owns the
+  interface, composing our filter program with other XDP programs;
+  the driver keeps identical DRA semantics, XSK creation, and
+  SCM_RIGHTS handoff (the same embedded ELF, pinned-map updates).
+
+Complementary rather than competing with bpfman's ecosystem: this
+driver is the DRA-native successor to the device-plugin-based
+AF_XDP pattern, and composes with bpfman where it is already the
+program manager.
+
 ## Determinism
 
 The as-deterministic-as-possible recipe is machine-checked: one

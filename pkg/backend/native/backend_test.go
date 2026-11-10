@@ -45,7 +45,7 @@ func TestHandoffProtocol(t *testing.T) {
 		FrameSize: 4096, NumFrames: 4096, Zerocopy: true,
 		Ethertypes: []uint16{0x88B8, 0x88BA},
 	}
-	s, err := startHandoffServer(path, info, fd1, fd2)
+	s, err := StartHandoffServer(path, info, fd1, fd2)
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}

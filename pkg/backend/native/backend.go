@@ -96,9 +96,10 @@ func (b *Backend) ensureLink(ifname string, ifindex int) error {
 	return nil
 }
 
+// Exported for reuse by other backends (bpfman).
 const (
-	defaultFrameSize = 4096
-	defaultNumFrames = 4096
+	DefaultFrameSize = 4096
+	DefaultNumFrames = 4096
 )
 
 func (b *Backend) Add(ctx context.Context, a *backend.Allocation) (string, error) {
@@ -120,8 +121,8 @@ func (b *Backend) Add(ctx context.Context, a *backend.Allocation) (string, error
 		return "", err
 	}
 
-	var frameSize uint32 = defaultFrameSize
-	var numFrames uint32 = defaultNumFrames
+	var frameSize uint32 = DefaultFrameSize
+	var numFrames uint32 = DefaultNumFrames
 	xsk, err := OpenXSK(a.Ifindex, a.QueueID, frameSize, numFrames, a.Zerocopy)
 	if err != nil {
 		return "", fmt.Errorf("opening XSK for %s:%d: %w", a.Ifname, a.QueueID, err)
@@ -152,7 +153,7 @@ func (b *Backend) Add(ctx context.Context, a *backend.Allocation) (string, error
 		Zerocopy:   xsk.Zerocopy,
 		Ethertypes: a.Ethertypes,
 	}
-	hs, err := startHandoffServer(sockPath, info, xskFd, xsk.umemFd)
+	hs, err := StartHandoffServer(sockPath, info, xskFd, xsk.umemFd)
 	if err != nil {
 		b.cleanup(a.Ifname, a.QueueID)
 		return "", fmt.Errorf("starting handoff server: %w", err)
