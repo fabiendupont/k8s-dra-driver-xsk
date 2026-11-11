@@ -1,16 +1,32 @@
 // Package bpfman implements backend.Backend by delegating XDP
-// program loading and attachment to a bpfman daemon (gRPC over its
-// Unix socket), while creating AF_XDP sockets in-process.
+// program loading to the bpfman eBPF Manager Operator through its
+// CRD API (BpfApplication), while creating AF_XDP sockets and
+// updating maps in-process.
 //
-// Complements the native backend: bpfman owns the XDP attach point
-// (its dispatcher coexists with other programs on the same
-// interface), while the driver keeps the DRA allocation semantics,
-// the XSK creation, and the SCM_RIGHTS handoff identical.
+// This uses the CRD API (BpfApplication) for program loading,
+// which is the supported external interface for the
+// operator-deployed bpfman (its gRPC socket is pod-local).
+// Maps are pinned under the shared /run/bpfman hostPath.
+//
+// KNOWN LIMITATION: the BpfApplication CRD's
+// networkNamespaces.pods field (required for XDP links) only
+// selects POD network namespaces — there is no host-netns option.
+// Program loading succeeds (bpfman assigns a program ID), but XDP
+// attachment to host network interfaces fails with
+// UpdateAttachInfoError. This is an upstream bpfman CRD design
+// limitation: the model targets pod-level network functions, not
+// host NIC attachment.
+//
+// For host-netns XDP attachment through bpfman, use the gRPC API
+// with a manually-deployed bpfman daemon that exposes its socket
+// on the host. The CRD path would need an upstream bpfman
+// enhancement to support host-netns attachment (e.g. a
+// networkNamespaces.host option or primaryNodeInterface
+// overriding the netns selector).
 //
 // The filter program is the same embedded ELF the native backend
-// loads; bpfman receives it as a File bytecode location and pins
-// its maps, which this backend then opens to insert XSK fds and
-// EtherType filters.
+// loads; it is written to a shared hostPath directory that the
+// bpfman agent can read.
 package bpfman
 
 import (
@@ -18,12 +34,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
-	bpfmanv1 "github.com/bpfman/bpfman/clients/gobpfman/v1"
 	"github.com/cilium/ebpf"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
 
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/backend"
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/backend/native"
@@ -32,41 +53,68 @@ import (
 const (
 	// programName must match the XDP program in the embedded ELF.
 	programName = "xdp_xsk_filter"
-	// defaultElfDir is where the driver writes the embedded ELF
-	// for bpfman's File bytecode location.
-	defaultElfDir = "/run/xsk/bpfman"
+
+	// elfDir is where the driver writes the embedded ELF for the
+	// bpfman agent to read. Must be a hostPath shared between the
+	// driver pod and the bpfman daemon pod. /run/bpfman is the
+	// bpfman operator's runtime hostPath.
+	elfDir = "/run/bpfman"
+
+	// crdNamespace is where BpfApplication resources are created.
+	crdNamespace = "bpfman"
+
+	// mapRoot is where bpfman pins program maps. Under the
+	// operator's runtime hostPath.
+	mapRoot = "/run/bpfman/fs/maps"
+
+	// loadTimeout is how long to wait for BpfApplicationState
+	// to report the program is loaded.
+	loadTimeout = 60 * time.Second
 )
 
-// Backend implements backend.Backend via a bpfman daemon.
-type Backend struct {
-	socketPath string
+var (
+	bpfAppGVR = schema.GroupVersionResource{
+		Group:    "bpfman.io",
+		Version:  "v1alpha1",
+		Resource: "bpfapplications",
+	}
+	bpfAppStateGVR = schema.GroupVersionResource{
+		Group:    "bpfman.io",
+		Version:  "v1alpha1",
+		Resource: "bpfapplicationstates",
+	}
+)
 
-	mu        sync.Mutex
-	conn      *grpc.ClientConn
-	client    bpfmanv1.BpfmanClient
-	elfDir    string // where the embedded ELF is written for bpfman
-	elfPath   string
-	programID uint32 // 0 = not loaded
-	mapPin    string
-	links     map[string]uint32 // ifname -> XDP link id
-	allocs    map[string]*alloc
+// Backend implements backend.Backend via the bpfman CRD API.
+type Backend struct {
+	client    dynamic.Interface
+	nodeName  string
+
+	mu       sync.Mutex
+	appName  string // BpfApplication resource name
+	elfPath  string
+	loaded   bool
+	mapDir   string // directory containing pinned maps for our program
+	allocs   map[string]*alloc
 }
 
 type alloc struct {
-	req      *backend.Allocation
-	xsk      *native.XSK
-	handoff  *native.HandoffServer
+	req     *backend.Allocation
+	xsk     *native.XSK
+	handoff *native.HandoffServer
 }
 
-// New creates the bpfman backend. socketPath is the bpfman gRPC
-// Unix socket (default /run/bpfman/bpfman.sock).
-func New(socketPath string) *Backend {
-	return &Backend{
-		socketPath: socketPath,
-		elfDir:     defaultElfDir,
-		links:      make(map[string]uint32),
-		allocs:     make(map[string]*alloc),
+// New creates the bpfman CRD backend.
+func New(nodeName string, restConfig *rest.Config) (*Backend, error) {
+	dyn, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("creating dynamic client: %w", err)
 	}
+	return &Backend{
+		client:   dyn,
+		nodeName: nodeName,
+		allocs:   make(map[string]*alloc),
+	}, nil
 }
 
 func (b *Backend) Name() string { return "bpfman" }
@@ -75,36 +123,18 @@ func allocKey(ifname string, queueID int) string {
 	return fmt.Sprintf("%s:%d", ifname, queueID)
 }
 
-// dial lazily connects to the bpfman daemon.
-func (b *Backend) dial() error {
-	if b.client != nil {
+// ensureLoaded writes the embedded ELF, creates the
+// BpfApplication CR, and waits for the program to be loaded.
+func (b *Backend) ensureLoaded(ctx context.Context, ifname string) error {
+	if b.loaded {
 		return nil
 	}
-	conn, err := grpc.NewClient("unix://"+b.socketPath,
-		grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return fmt.Errorf("dialing bpfman at %s: %w", b.socketPath, err)
-	}
-	b.conn = conn
-	b.client = bpfmanv1.NewBpfmanClient(conn)
-	return nil
-}
 
-// ensureProgram writes the embedded ELF to disk and loads it via
-// bpfman exactly once. The response's MapPinPath is where bpfman
-// pinned the program's maps.
-func (b *Backend) ensureProgram() error {
-	if b.programID != 0 {
-		return nil
+	// Write the embedded ELF to the shared hostPath.
+	if err := os.MkdirAll(elfDir, 0755); err != nil {
+		return fmt.Errorf("creating %s: %w", elfDir, err)
 	}
-	if err := b.dial(); err != nil {
-		return err
-	}
-
-	if err := os.MkdirAll(b.elfDir, 0755); err != nil {
-		return fmt.Errorf("creating %s: %w", b.elfDir, err)
-	}
-	elfPath := filepath.Join(b.elfDir, "xdp_filter.bpf.o")
+	elfPath := filepath.Join(elfDir, "xsk-dra-driver.bpf.o")
 	elfBytes, err := native.FilterELFBytes()
 	if err != nil {
 		return err
@@ -113,64 +143,243 @@ func (b *Backend) ensureProgram() error {
 		return fmt.Errorf("writing filter ELF: %w", err)
 	}
 	b.elfPath = elfPath
+	b.appName = fmt.Sprintf("xsk-dra-driver-%s", b.nodeName)
 
-	resp, err := b.client.Load(context.Background(), &bpfmanv1.LoadRequest{
-		Bytecode: &bpfmanv1.BytecodeLocation{
-			Location: &bpfmanv1.BytecodeLocation_File{File: elfPath},
+	// Create the BpfApplication CR.
+	app := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "bpfman.io/v1alpha1",
+		"kind":       "BpfApplication",
+		"metadata": map[string]interface{}{
+			"name":      b.appName,
+			"namespace": crdNamespace,
 		},
-		Metadata: map[string]string{
-			"owner": "k8s-dra-driver-xsk",
-		},
-		Info: []*bpfmanv1.LoadInfo{{
-			Name:        programName,
-			ProgramType: bpfmanv1.BpfmanProgramType_XDP,
-		}},
-	})
-	if err != nil {
-		return fmt.Errorf("bpfman Load: %w", err)
-	}
-	if len(resp.Programs) == 0 {
-		return fmt.Errorf("bpfman Load: no programs in response")
-	}
-	info := resp.Programs[0]
-	if info.KernelInfo == nil {
-		return fmt.Errorf("bpfman Load: no kernel info in response")
-	}
-	b.programID = info.KernelInfo.Id
-	b.mapPin = info.Info.GetMapPinPath()
-	return nil
-}
-
-// ensureLink attaches the loaded program to the interface via
-// bpfman (XDP attach with default priority; bpfman's dispatcher
-// composes it with other programs on the interface).
-func (b *Backend) ensureLink(ifname string) error {
-	if _, ok := b.links[ifname]; ok {
-		return nil
-	}
-	resp, err := b.client.Attach(context.Background(), &bpfmanv1.AttachRequest{
-		Id: b.programID,
-		Attach: &bpfmanv1.AttachInfo{
-			Info: &bpfmanv1.AttachInfo_XdpAttachInfo{
-				XdpAttachInfo: &bpfmanv1.XDPAttachInfo{
-					Iface: ifname,
+		"spec": map[string]interface{}{
+			"byteCode": map[string]interface{}{
+				"path": elfPath,
+			},
+			"nodeSelector": map[string]interface{}{
+				"matchLabels": map[string]interface{}{
+					"kubernetes.io/hostname": b.nodeName,
+				},
+			},
+			"programs": []interface{}{
+				map[string]interface{}{
+					"name": programName,
+					"type": "XDP",
+					"xdp": map[string]interface{}{
+						"links": []interface{}{
+							map[string]interface{}{
+								"interfaceSelector": map[string]interface{}{
+									"interfaces": []interface{}{ifname},
+								},
+								"networkNamespaces": map[string]interface{}{"pods": map[string]interface{}{}},
+							},
+						},
+					},
 				},
 			},
 		},
-	})
+	}}
+
+	_, err = b.client.Resource(bpfAppGVR).Namespace(crdNamespace).Create(
+		ctx, app, metav1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("bpfman Attach to %s: %w", ifname, err)
+		// If it already exists (driver restart), update it.
+		existing, getErr := b.client.Resource(bpfAppGVR).Namespace(
+			crdNamespace).Get(ctx, b.appName, metav1.GetOptions{})
+		if getErr != nil {
+			return fmt.Errorf("creating BpfApplication: %w (get: %v)", err, getErr)
+		}
+		app.SetResourceVersion(existing.GetResourceVersion())
+		_, err = b.client.Resource(bpfAppGVR).Namespace(crdNamespace).Update(
+			ctx, app, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("updating BpfApplication: %w", err)
+		}
 	}
-	b.links[ifname] = resp.LinkId
+
+	// Wait for BpfApplicationState to report loaded.
+	if err := b.waitForLoad(ctx); err != nil {
+		return err
+	}
+
+	b.loaded = true
+	klog.InfoS("bpfman program loaded", "app", b.appName,
+		"elf", b.elfPath, "interface", ifname)
 	return nil
+}
+
+// waitForLoad polls the BpfApplicationState until the program is
+// loaded, then discovers the map pin directory.
+func (b *Backend) waitForLoad(ctx context.Context) error {
+	deadline := time.Now().Add(loadTimeout)
+	stateName := b.appName
+
+	for time.Now().Before(deadline) {
+		state, err := b.client.Resource(bpfAppStateGVR).Namespace(
+			crdNamespace).Get(ctx, stateName, metav1.GetOptions{})
+		if err != nil {
+			// State may not exist yet; retry.
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		// Check the overall load status.
+		status, found, _ := unstructured.NestedString(
+			state.Object, "status", "appLoadStatus")
+		if !found {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		if status == "Loaded" || status == "Succeeded" ||
+			status == "Complete" {
+			// Find the map pin directory. bpfman pins maps under
+			// /run/bpfman/fs/maps/<uuid>/ on the host.
+			if err := b.discoverMapDir(ctx, state); err != nil {
+				return fmt.Errorf("discovering map directory: %w", err)
+			}
+			return nil
+		}
+
+		if strings.Contains(strings.ToLower(status), "fail") ||
+			strings.Contains(strings.ToLower(status), "error") {
+			// Check conditions for details.
+			conditions, _, _ := unstructured.NestedSlice(
+				state.Object, "status", "conditions")
+			for _, c := range conditions {
+				cond, ok := c.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				msg, _, _ := unstructured.NestedString(cond, "message")
+				if msg != "" {
+					return fmt.Errorf("bpfman load failed: %s: %s", status, msg)
+				}
+			}
+			return fmt.Errorf("bpfman load failed: %s", status)
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("timeout waiting for BpfApplicationState %s", stateName)
+}
+
+// discoverMapDir finds the pinned map directory for our program.
+// bpfman pins maps under /run/bpfman/fs/maps/<uuid>/ — we look for
+// the directory containing our maps.
+func (b *Backend) discoverMapDir(ctx context.Context,
+	state *unstructured.Unstructured) error {
+
+	// Walk /run/bpfman/fs/maps/ looking for our maps.
+	entries, err := os.ReadDir(mapRoot)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w (is the bpfman runtime "+
+			"hostPath mounted?)", mapRoot, err)
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(mapRoot, e.Name())
+		// Check if this directory has our maps.
+		if _, err := os.Stat(filepath.Join(dir, "xsk_map")); err == nil {
+			b.mapDir = dir
+			klog.InfoS("Found bpfman map directory", "dir", dir)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("no map directory with xsk_map under %s", mapRoot)
 }
 
 // openMap opens one of the program's pinned maps by name.
 func (b *Backend) openMap(name string) (*ebpf.Map, error) {
-	if b.mapPin == "" {
-		return nil, fmt.Errorf("program maps not pinned (no MapPinPath)")
+	if b.mapDir == "" {
+		return nil, fmt.Errorf("map directory not discovered")
 	}
-	return ebpf.LoadPinnedMap(filepath.Join(b.mapPin, name), nil)
+	return ebpf.LoadPinnedMap(filepath.Join(b.mapDir, name), nil)
+}
+
+// updateInterface adds the interface to the BpfApplication's
+// XDP links if not already present.
+func (b *Backend) updateInterface(ctx context.Context, ifname string) error {
+	app, err := b.client.Resource(bpfAppGVR).Namespace(
+		crdNamespace).Get(ctx, b.appName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("getting BpfApplication: %w", err)
+	}
+
+	programs, found, _ := unstructured.NestedSlice(app.Object,
+		"spec", "programs")
+	if !found || len(programs) == 0 {
+		return fmt.Errorf("BpfApplication has no programs")
+	}
+
+	prog, ok := programs[0].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("invalid program spec")
+	}
+
+	xdp, found, _ := unstructured.NestedMap(prog, "xdp")
+	if !found {
+		return fmt.Errorf("no xdp section")
+	}
+
+	links, _, _ := unstructured.NestedSlice(xdp, "links")
+	for _, l := range links {
+		link, ok := l.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		ifaces, _, _ := unstructured.NestedStringSlice(link,
+			"interfaceSelector", "interfaces")
+		for _, i := range ifaces {
+			if i == ifname {
+				return nil // already present
+			}
+		}
+	}
+
+	// Add the new interface to the first link's selector.
+	if len(links) > 0 {
+		link, ok := links[0].(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("invalid link")
+		}
+		sel, _, _ := unstructured.NestedMap(link, "interfaceSelector")
+		ifaces, _, _ := unstructured.NestedStringSlice(sel, "interfaces")
+		newIfaces := append(ifaces, ifname)
+		if err := unstructured.SetNestedStringSlice(sel, newIfaces,
+			"interfaces"); err != nil {
+			return err
+		}
+		if err := unstructured.SetNestedMap(link, sel,
+			"interfaceSelector"); err != nil {
+			return err
+		}
+		links[0] = link
+		if err := unstructured.SetNestedSlice(xdp, links, "links"); err != nil {
+			return err
+		}
+		if err := unstructured.SetNestedMap(prog, xdp, "xdp"); err != nil {
+			return err
+		}
+		programs[0] = prog
+		if err := unstructured.SetNestedSlice(app.Object, programs,
+			"spec", "programs"); err != nil {
+			return err
+		}
+
+		_, err = b.client.Resource(bpfAppGVR).Namespace(
+			crdNamespace).Update(ctx, app, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("updating BpfApplication interfaces: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (b *Backend) Add(ctx context.Context, a *backend.Allocation) (string, error) {
@@ -186,15 +395,16 @@ func (b *Backend) Add(ctx context.Context, a *backend.Allocation) (string, error
 		return "", fmt.Errorf("queue %s already allocated", key)
 	}
 
-	if err := b.ensureProgram(); err != nil {
-		return "", err
-	}
-	if err := b.ensureLink(a.Ifname); err != nil {
+	if err := b.ensureLoaded(ctx, a.Ifname); err != nil {
 		return "", err
 	}
 
-	// XSK creation is program-loader-agnostic: same in-process
-	// sockets, same handoff, as the native backend.
+	// If this is a new interface, add it to the BpfApplication.
+	if err := b.updateInterface(ctx, a.Ifname); err != nil {
+		return "", err
+	}
+
+	// XSK creation is program-loader-agnostic.
 	xsk, err := native.OpenXSK(a.Ifindex, a.QueueID,
 		native.DefaultFrameSize, native.DefaultNumFrames, a.Zerocopy)
 	if err != nil {
@@ -226,7 +436,7 @@ func (b *Backend) Add(ctx context.Context, a *backend.Allocation) (string, error
 		}
 	}
 
-	sockPath := filepath.Join(filepath.Dir(b.elfDir),
+	sockPath := filepath.Join(filepath.Dir(elfDir),
 		fmt.Sprintf("%s-q%d.sock", a.Ifname, a.QueueID))
 	info := native.HandoffInfo{
 		Ifname:     a.Ifname,
@@ -253,7 +463,6 @@ func (b *Backend) Del(ctx context.Context, ifname string, queueID int) error {
 	return b.cleanup(ctx, ifname, queueID)
 }
 
-// cleanup removes an allocation. Caller holds b.mu.
 func (b *Backend) cleanup(ctx context.Context, ifname string, queueID int) error {
 	key := allocKey(ifname, queueID)
 	a, ok := b.allocs[key]
@@ -276,35 +485,17 @@ func (b *Backend) cleanup(ctx context.Context, ifname string, queueID int) error
 	}
 	a.xsk.Close()
 
-	// Detach the link when the last queue on this interface is
-	// gone; unload the program when no allocations remain.
-	if !b.ifaceHasAllocs(ifname) {
-		if linkID, ok := b.links[ifname]; ok {
-			if _, err := b.client.Detach(ctx, &bpfmanv1.DetachRequest{
-				LinkId: linkID,
-			}); err != nil {
-				return fmt.Errorf("bpfman Detach from %s: %w", ifname, err)
-			}
-			delete(b.links, ifname)
+	// Delete the BpfApplication when no allocations remain.
+	if len(b.allocs) == 0 && b.loaded {
+		if err := b.client.Resource(bpfAppGVR).Namespace(
+			crdNamespace).Delete(ctx, b.appName,
+			metav1.DeleteOptions{}); err != nil {
+			return fmt.Errorf("deleting BpfApplication: %w", err)
 		}
+		b.loaded = false
+		b.mapDir = ""
+		klog.InfoS("Deleted BpfApplication", "name", b.appName)
 	}
-	if len(b.allocs) == 0 && b.programID != 0 {
-		if _, err := b.client.Unload(ctx, &bpfmanv1.UnloadRequest{
-			Id: b.programID,
-		}); err != nil {
-			return fmt.Errorf("bpfman Unload: %w", err)
-		}
-		b.programID = 0
-		b.mapPin = ""
-	}
-	return nil
-}
 
-func (b *Backend) ifaceHasAllocs(ifname string) bool {
-	for k := range b.allocs {
-		if len(k) > len(ifname)+1 && k[:len(ifname)] == ifname && k[len(ifname)] == ':' {
-			return true
-		}
-	}
-	return false
+	return nil
 }

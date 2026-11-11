@@ -63,6 +63,8 @@ spec:
               mountPath: /etc/cdi
             - name: handoff-dir
               mountPath: /run/xsk
+            - name: bpfman-runtime
+              mountPath: /run/bpfman
 
       volumes:
         - name: plugin-socket-dir
@@ -80,4 +82,8 @@ spec:
         - name: handoff-dir
           hostPath:
             path: /run/xsk
+            type: DirectoryOrCreate
+        - name: bpfman-runtime
+          hostPath:
+            path: /run/bpfman
             type: DirectoryOrCreate

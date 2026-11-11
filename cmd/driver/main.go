@@ -39,8 +39,7 @@ var (
 	xglCheckBin  = flag.String("xgl-check-bin", os.Getenv("XGL_CHECK_BIN"), "xgl_check binary path (xdp-graph-lib); empty disables the graph validation gate")
 	includeVirt  = flag.Bool("include-virtual", false, "include virtual interfaces (veth) in queue discovery — development/testing only")
 	registryDir  = flag.String("plugins-registry-dir", "/var/lib/kubelet/plugins_registry", "kubelet plugins_registry directory for the registration socket")
-	backendKind  = flag.String("backend", "native", "XSK backend: native (in-process XDP) or bpfman (delegate program loading to a bpfman daemon)")
-	bpfmanSock   = flag.String("bpfman-socket", "/run/bpfman/bpfman.sock", "bpfman daemon gRPC Unix socket path (bpfman backend)")
+	backendKind  = flag.String("backend", "native", "XSK backend: native (in-process XDP) or bpfman (delegate program loading to the bpfman eBPF Manager Operator via CRDs)")
 )
 
 func main() {
@@ -77,7 +76,11 @@ func main() {
 	case "native":
 		xskBackend = native.New(*handoffDir)
 	case "bpfman":
-		xskBackend = bpfmanbackend.New(*bpfmanSock)
+		bp, err := bpfmanbackend.New(*nodeName, cfg)
+		if err != nil {
+			klog.Fatalf("Creating bpfman backend: %v", err)
+		}
+		xskBackend = bp
 	default:
 		klog.Fatalf("unknown backend %q (native or bpfman)", *backendKind)
 	}

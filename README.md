@@ -119,13 +119,19 @@ driver is the DRA-native successor to the device-plugin-based
 AF_XDP pattern, and composes with bpfman where it is already the
 program manager.
 
-**Note on the OpenShift eBPF Manager Operator**: the
-operator-deployed bpfman keeps its gRPC socket as a pod-local
-emptyDir — it is not exposed on the node filesystem. The bpfman
-backend requires a bpfman daemon whose socket is host-accessible
-(e.g. a manual deployment with `--socket-path /run/bpfman/bpfman.sock`,
-or a future operator change). The operator's bpfman is consumed
-through its CRDs, not direct gRPC connections from other pods.
+**bpfman integration status**: the backend uses the CRD API
+(`BpfApplication`) for program loading, which is the supported
+external interface for the operator-deployed bpfman. Program
+loading works (bpfman assigns a program ID and pins maps under the
+shared `/run/bpfman` hostPath). However, **XDP attachment to host
+network interfaces through the CRD model is currently blocked** by
+an upstream bpfman design limitation: the required
+`networkNamespaces.pods` field only selects pod network namespaces,
+with no host-netns option. Attachment to host NICs requires either
+a manually-deployed bpfman with a host-exposed gRPC socket, or an
+upstream bpfman enhancement to support host-netns attachment in
+the CRD model. The native backend is the recommended and fully
+validated path on OpenShift today.
 
 ## Determinism
 
