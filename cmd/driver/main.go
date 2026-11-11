@@ -16,7 +16,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/cilium/ebpf/rlimit"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -82,11 +82,16 @@ func main() {
 		klog.Fatalf("unknown backend %q (native or bpfman)", *backendKind)
 	}
 
-	// BPF maps pin memory; on kernels < 5.11 this is accounted
-	// against MEMLOCK, which defaults to 64 KiB — far too small.
-	// Best effort: on 5.11+ (memcg accounting) this is a no-op.
-	if err := rlimit.RemoveMemlock(); err != nil {
-		klog.V(2).InfoS("could not remove memlock rlimit (ok on 5.11+ kernels)", "err", err)
+	// AF_XDP UMEM registration still charges RLIMIT_MEMLOCK even on
+	// kernels where BPF maps are memcg-accounted (5.11+): cilium's
+	// RemoveMemlock is a no-op there, but the XSK umem (16 MiB by
+	// default) exceeds typical 8 MiB container limits. Raise it
+	// explicitly; requires CAP_SYS_RESOURCE.
+	{
+		newLimit := unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY}
+		if err := unix.Prlimit(0, unix.RLIMIT_MEMLOCK, &newLimit, nil); err != nil {
+			klog.InfoS("could not raise memlock rlimit (UMEM allocation may fail)", "err", err)
+		}
 	}
 
 	d := driver.NewDriver(*driverName, *nodeName, *cdiDir,

@@ -119,6 +119,14 @@ driver is the DRA-native successor to the device-plugin-based
 AF_XDP pattern, and composes with bpfman where it is already the
 program manager.
 
+**Note on the OpenShift eBPF Manager Operator**: the
+operator-deployed bpfman keeps its gRPC socket as a pod-local
+emptyDir — it is not exposed on the node filesystem. The bpfman
+backend requires a bpfman daemon whose socket is host-accessible
+(e.g. a manual deployment with `--socket-path /run/bpfman/bpfman.sock`,
+or a future operator change). The operator's bpfman is consumed
+through its CRDs, not direct gRPC connections from other pods.
+
 ## Determinism
 
 The as-deterministic-as-possible recipe is machine-checked: one

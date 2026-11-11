@@ -441,3 +441,18 @@ func (x *XSK) Stats() (xdpStatistics, error) {
 	}
 	return st, nil
 }
+
+// selinuxContainerFileT is the SELinux label that unprivileged
+// containers (container_t) can read/write. On SELinux systems
+// (OpenShift), sockets created by the privileged driver inherit
+// labels the consumer cannot access; labeling them container_file_t
+// lets restricted pods use the handoff with zero capabilities.
+const selinuxContainerFileT = "system_u:object_r:container_file_t:s0"
+
+// labelForContainers sets the SELinux label of a path to
+// container_file_t. Best effort: a no-op when SELinux is disabled
+// or the xattr write fails (non-SELinux systems).
+func labelForContainers(path string) {
+	_ = unix.Setxattr(path, "security.selinux",
+		[]byte(selinuxContainerFileT+"\x00"), 0)
+}

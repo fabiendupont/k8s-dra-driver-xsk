@@ -47,6 +47,7 @@ func StartHandoffServer(path string, info HandoffInfo, xskFd, umemFd int) (*Hand
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, fmt.Errorf("creating handoff dir: %w", err)
 	}
+	labelForContainers(filepath.Dir(path))
 	// Remove a stale socket from a previous run.
 	if err := os.RemoveAll(path); err != nil {
 		return nil, fmt.Errorf("removing stale socket: %w", err)
@@ -55,6 +56,7 @@ func StartHandoffServer(path string, info HandoffInfo, xskFd, umemFd int) (*Hand
 	if err != nil {
 		return nil, fmt.Errorf("listening on %s: %w", path, err)
 	}
+	labelForContainers(path)
 	s := &HandoffServer{ln: ln, path: path, info: info, xskFd: xskFd, umemFd: umemFd}
 	go s.acceptLoop()
 	return s, nil

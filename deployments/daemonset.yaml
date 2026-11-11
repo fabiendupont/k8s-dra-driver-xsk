@@ -51,7 +51,7 @@ spec:
             runAsUser: 0
             capabilities:
               drop: ["ALL"]
-              add: ["CAP_BPF", "CAP_NET_ADMIN"]
+              add: ["CAP_BPF", "CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_SYS_RESOURCE"]
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
           volumeMounts:
