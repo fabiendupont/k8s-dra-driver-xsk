@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "k8s-dra-driver-xsk.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k8s-dra-driver-xsk.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "k8s-dra-driver-xsk.fullname" . }}
+  labels:
+    {{- include "k8s-dra-driver-xsk.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceslices"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  {{- if eq .Values.backend "bpfman" }}
+  - apiGroups: ["bpfman.io"]
+    resources: ["bpfapplications", "bpfapplicationstates"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  {{- end }}
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "k8s-dra-driver-xsk.fullname" . }}
+  labels:
+    {{- include "k8s-dra-driver-xsk.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "k8s-dra-driver-xsk.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "k8s-dra-driver-xsk.fullname" . }}
+    namespace: {{ .Release.Namespace }}

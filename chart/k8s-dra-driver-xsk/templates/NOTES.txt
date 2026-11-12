@@ -1,0 +1,13 @@
+The XSK DRA driver is deployed as "{{ include "k8s-dra-driver-xsk.fullname" . }}"
+in namespace {{ .Release.Namespace }} on nodes labelled xsk.dra.io/capable=true.
+
+Backend: {{ .Values.backend }}
+HSR/PRP RedBox streams: {{ if .Values.hsrprp.enabled }}enabled{{ else }}disabled{{ end }}
+
+Verify:
+  kubectl -n {{ .Release.Namespace }} rollout status daemonset/{{ include "k8s-dra-driver-xsk.fullname" . }}
+  kubectl get resourceslices
+
+Claim devices with the "xsk" (generic), "xsk-iec61850" (GOOSE+SV preset)
+{{- if .Values.hsrprp.enabled }} or "hsr-prp-stream" (redundant streams){{ end }}
+device classes — see deployments/examples/.

@@ -1,0 +1,13 @@
+apiVersion: v2
+name: k8s-dra-driver-xsk
+description: |
+  DRA driver exposing AF_XDP sockets (and HSR/PRP redundant streams,
+  IEC 62439-3) to pods via Kubernetes Dynamic Resource Allocation.
+type: application
+# appVersion tracks the driver release; the image tag defaults to it.
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/fabiendupont/k8s-dra-driver-xsk
+sources:
+  - https://github.com/fabiendupont/k8s-dra-driver-xsk
+  - https://github.com/fabiendupont/xdp-hsr-prp

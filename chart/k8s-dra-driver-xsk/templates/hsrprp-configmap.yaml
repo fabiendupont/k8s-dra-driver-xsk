@@ -1,0 +1,28 @@
+{{- if .Values.hsrprp.enabled }}
+{{- $driver := .Values.driverName -}}
+# Node-level HSR/PRP RedBox configuration consumed by the driver
+# (--hsrprp-config). Groups define the redundancy rings wired on
+# this node; claims allocate streams within them.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "k8s-dra-driver-xsk.fullname" . }}-hsrprp
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k8s-dra-driver-xsk.labels" . | nindent 4 }}
+data:
+  hsrprp.yaml: |
+    groups:
+    {{- range .Values.hsrprp.groups }}
+      - name: {{ .name }}
+        mode: {{ .mode }}
+        ports:
+        {{- range .ports }}
+          - {{ . }}
+        {{- end }}
+        streams:
+        {{- range .streams }}
+          - ethertype: {{ .ethertype | quote }}
+        {{- end }}
+    {{- end }}
+{{- end }}

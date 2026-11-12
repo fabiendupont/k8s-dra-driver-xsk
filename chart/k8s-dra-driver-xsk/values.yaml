@@ -1,0 +1,66 @@
+# Default values for k8s-dra-driver-xsk.
+
+image:
+  repository: quay.io/fabiendupont/dra-xsk-driver
+  # Defaults to the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# XSK backend: "native" loads XDP and creates AF_XDP sockets
+# in-process (needs CAP_BPF/CAP_NET_ADMIN); "bpfman" delegates
+# program loading to the bpfman eBPF Manager Operator via CRDs and
+# CSI volume map access (deploy the bpfman operator first).
+backend: native
+
+# Resource names are fixed (not release-prefixed) so the chart is a
+# drop-in replacement for the raw manifests in deployments/.
+nameOverride: ""
+fullnameOverride: ""
+
+# The DRA driver name is fixed across all resources (device classes,
+# CEL selectors, plugin socket path /var/lib/kubelet/plugins/<name>):
+# changing it requires updating claim selectors too.
+driverName: xsk.dra.io
+
+# XDP-capable nodes must carry this label.
+nodeSelector:
+  xsk.dra.io/capable: "true"
+
+tolerations: []
+
+affinity: {}
+
+# Dev/testing only: include veths in queue discovery (kind nodes
+# expose only veths).
+includeVirtual: false
+
+securityContext:
+  # The kind sandbox's containerd ignores capabilities.add, so the
+  # minimal-capability posture cannot take effect there — set
+  # privileged: true for kind only. See README (Security).
+  privileged: false
+  runAsUser: 0
+  capabilities:
+    drop: ["ALL"]
+    add: ["CAP_BPF", "CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_SYS_RESOURCE"]
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+
+resources: {}
+
+# HSR/PRP RedBox streams: exposes deduplicated IEC 62439-3 streams
+# (one device per group × EtherType) as a second DRA device pool.
+# The node acts as a RedBox; pods receive one clean, untagged copy
+# of every frame. Requires the xdp-hsr-prp BPF objects baked into
+# the image (they are, by default).
+hsrprp:
+  enabled: false
+  # Node-level redundancy groups. Which ports form a ring is a
+  # property of the machine's wiring, not of any claim.
+  groups:
+    - name: ring1
+      mode: hsr            # hsr (ring); prp not yet implemented
+      ports: [ring0a, ring0b]
+      streams:
+        - ethertype: "0x88B8"   # GOOSE
+        - ethertype: "0x88BA"   # SV

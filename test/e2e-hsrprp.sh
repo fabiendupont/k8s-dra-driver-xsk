@@ -59,24 +59,41 @@ if ! kind get clusters 2>/dev/null | grep -q "^$CLUSTER$"; then
         --config "$REPO_ROOT/test/e2e/kind-config.yaml"
     kind load docker-image "$IMAGE" --name "$CLUSTER"
     $K wait --for=condition=ready node --all --timeout=120s
-    # Label the worker so the DaemonSet schedules; add the dev-only
-    # --include-virtual flag (kind nodes expose only veths).
+    # Label the worker so the DaemonSet schedules.
     $K label --overwrite node "$NODE" xsk.dra.io/capable=true
-    $K apply -f "$REPO_ROOT/deployments/rbac.yaml"
-    $K apply -f "$REPO_ROOT/deployments/device-class.yaml"
-    $K apply -f "$REPO_ROOT/deployments/daemonset.yaml"
-    $K -n kube-system set image daemonset/dra-xsk-driver driver="$IMAGE"
-    # Same kind-sandbox caveats as test/e2e/run.sh: capabilities.add
-    # is ignored by this containerd, and :latest defaults to Always.
-    $K -n kube-system patch daemonset dra-xsk-driver --type=json -p='[
-      {"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"},
-      {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--include-virtual"},
-      {"op":"add","path":"/spec/template/spec/containers/0/securityContext/privileged","value":true},
-      {"op":"replace","path":"/spec/template/spec/containers/0/securityContext/allowPrivilegeEscalation","value":true}
-    ]'
 else
     echo "=== reusing kind cluster $CLUSTER"
     kind load docker-image "$IMAGE" --name "$CLUSTER"
+fi
+
+# Deploy via the Helm chart (kind values: include-virtual, privileged
+# — kind's containerd ignores capabilities.add —, hsrprp streams).
+if ! helm status dra-xsk-driver -n kube-system >/dev/null 2>&1; then
+    # Migrate from the raw manifests (deployments/) if this cluster
+    # predates the chart: helm refuses to adopt existing resources.
+    $K delete --ignore-not-found -n kube-system \
+        daemonset/dra-xsk-driver serviceaccount/dra-xsk-driver
+    $K delete --ignore-not-found \
+        clusterrole/dra-xsk-driver clusterrolebinding/dra-xsk-driver
+    $K delete --ignore-not-found \
+        deviceclass/xsk deviceclass/xsk-iec61850 deviceclass/hsr-prp-stream
+    $K delete --ignore-not-found -n kube-system configmap/dra-xsk-hsrprp
+fi
+helm upgrade --install dra-xsk-driver "$REPO_ROOT/chart/k8s-dra-driver-xsk" \
+    -n kube-system --kube-context "kind-$CLUSTER" \
+    -f "$REPO_ROOT/test/e2e/values-kind.yaml" \
+    --set image.tag=e2e --wait --timeout 180s
+
+# Workaround: the kubelet's plugin watcher sometimes fails to pick up
+# the re-created registration socket after a driver pod restart. If
+# the driver is not registered within 60s, restart the kubelet once
+# (its startup re-scan always registers; the driver re-publishes its
+# ResourceSlices on registration, so that path is safe).
+if ! timeout 60 bash -c "until $K -n kube-system logs ds/dra-xsk-driver 2>/dev/null | grep -q 'registered with kubelet successfully'; do sleep 5; done"; then
+    echo "    driver not registered after 60s; restarting kubelet (known kind flake)"
+    $D systemctl restart kubelet
+    timeout 90 bash -c "until $K -n kube-system logs ds/dra-xsk-driver 2>/dev/null | grep -q 'registered with kubelet successfully'; do sleep 5; done" \
+        || fail "driver never registered with the kubelet"
 fi
 
 echo "=== wiring ring ports on $NODE"
@@ -98,42 +115,6 @@ $D sh -c '
 # Static build; the kind node is glibc but the binary is static.
 CGO_ENABLED=0 go build -trimpath -o /tmp/opencode/hsrbox ./cmd/hsrbox
 docker cp /tmp/opencode/hsrbox "$NODE":/usr/bin/hsrbox
-
-echo "=== deploying HSR/PRP config, device class, driver update"
-$K apply -f "$REPO_ROOT/deployments/hsrprp-configmap.yaml"
-$K apply -f "$REPO_ROOT/deployments/device-class-hsrprp.yaml"
-# Mount the config + enable the flag on the DaemonSet (idempotent).
-if ! $K -n kube-system get daemonset dra-xsk-driver \
-    -o jsonpath='{.spec.template.spec.volumes[*].name}' | grep -q hsrprp-config; then
-  $K -n kube-system patch daemonset dra-xsk-driver --type=json -p='[
-    {"op":"add","path":"/spec/template/spec/volumes/-","value":{
-       "name":"hsrprp-config","configMap":{"name":"dra-xsk-hsrprp"}}},
-    {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{
-       "name":"hsrprp-config","mountPath":"/etc/xsk-dra"}}
-  ]'
-fi
-if ! $K -n kube-system get daemonset dra-xsk-driver \
-    -o jsonpath='{.spec.template.spec.containers[0].args}' | grep -q hsrprp-config; then
-  $K -n kube-system patch daemonset dra-xsk-driver --type=json \
-    -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--hsrprp-config=/etc/xsk-dra/hsrprp.yaml"}]'
-fi
-$K -n kube-system set image daemonset/dra-xsk-driver driver="$IMAGE"
-# The image tag never changes between runs; force the rollout so a
-# rebuilt image actually deploys.
-$K -n kube-system rollout restart daemonset/dra-xsk-driver
-$K -n kube-system rollout status daemonset/dra-xsk-driver --timeout=180s
-
-# Workaround: the kubelet's plugin watcher sometimes fails to pick up
-# the re-created registration socket after a driver pod restart. If
-# the driver is not registered within 60s, restart the kubelet once
-# (its startup re-scan always registers; the driver re-publishes its
-# ResourceSlices on registration, so that path is safe).
-if ! timeout 60 bash -c "until $K -n kube-system logs ds/dra-xsk-driver 2>/dev/null | grep -q 'registered with kubelet successfully'; do sleep 5; done"; then
-    echo "    driver not registered after 60s; restarting kubelet (known kind flake)"
-    $D systemctl restart kubelet
-    timeout 90 bash -c "until $K -n kube-system logs ds/dra-xsk-driver 2>/dev/null | grep -q 'registered with kubelet successfully'; do sleep 5; done" \
-        || fail "driver never registered with the kubelet"
-fi
 
 echo "=== checking stream devices"
 STREAMS=$($K get resourceslices -o json \

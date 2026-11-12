@@ -1,0 +1,18 @@
+# Values for the kind e2e runs (test/e2e/run.sh and
+# test/e2e-hsrprp.sh). The image is kind-loaded locally, never
+# pulled from a registry.
+image:
+  tag: e2e
+  pullPolicy: IfNotPresent
+
+# kind nodes expose only veths.
+includeVirtual: true
+
+# kind's containerd ignores capabilities.add — the minimal-
+# capability securityContext cannot take effect there.
+securityContext:
+  privileged: true
+
+# The HSR/PRP e2e wires ring0a/ring0b veths on the worker node.
+hsrprp:
+  enabled: true

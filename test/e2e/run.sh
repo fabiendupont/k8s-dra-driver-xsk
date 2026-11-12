@@ -39,27 +39,17 @@ $K wait --for=condition=ready node --all --timeout=120s
 # dev-only --include-virtual flag (kind nodes expose only veths).
 $K label --overwrite node "$CLUSTER-worker" xsk.dra.io/capable=true
 
-echo "=== deploying driver"
-$K apply -f "$REPO_ROOT/deployments/rbac.yaml"
-$K apply -f "$REPO_ROOT/deployments/device-class.yaml"
-$K apply -f "$REPO_ROOT/deployments/daemonset.yaml"
-# Use the image loaded into kind (not the registry :latest), and
-# override the Always policy that the :latest tag defaulted to.
-$K -n kube-system set image daemonset/dra-xsk-driver driver="$IMAGE"
-$K -n kube-system patch daemonset dra-xsk-driver --type=json \
-    -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]'
-# Dev-only flag: kind nodes expose only veths.
-$K -n kube-system patch daemonset dra-xsk-driver --type=json \
-    -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--include-virtual"}]'
-# This sandbox's containerd ignores capabilities.add (drops apply,
-# adds silently do not), so the minimal-capability securityContext
-# cannot take effect here. Run privileged for the e2e; on normal
-# clusters the DaemonSet's CAP_BPF/CAP_NET_ADMIN list is correct.
-$K -n kube-system patch daemonset dra-xsk-driver --type=json \
-    -p='[{"op":"add","path":"/spec/template/spec/containers/0/securityContext/privileged","value":true},{"op":"replace","path":"/spec/template/spec/containers/0/securityContext/allowPrivilegeEscalation","value":true}]'
-
-echo "=== waiting for driver rollout"
-$K -n kube-system rollout status daemonset/dra-xsk-driver --timeout=120s
+echo "=== deploying driver (Helm chart)"
+# kind values: include-virtual (kind nodes expose only veths) and
+# privileged (this sandbox's containerd ignores capabilities.add, so
+# the minimal-capability securityContext cannot take effect there;
+# on normal clusters the CAP_BPF/CAP_NET_ADMIN list is correct).
+# No HSR/PRP groups here — run.sh has no ring ports wired.
+helm upgrade --install dra-xsk-driver "$REPO_ROOT/chart/k8s-dra-driver-xsk" \
+    -n kube-system --kube-context "kind-$CLUSTER" \
+    -f "$REPO_ROOT/test/e2e/values-kind.yaml" \
+    --set hsrprp.enabled=false \
+    --set image.tag=e2e --wait --timeout 120s
 
 echo "=== checking ResourceSlice publication"
 $K wait --for=jsonpath='{.status.deviceCount}'=0 resource_slice --all \

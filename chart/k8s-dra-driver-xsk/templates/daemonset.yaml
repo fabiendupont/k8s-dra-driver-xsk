@@ -1,0 +1,141 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "k8s-dra-driver-xsk.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k8s-dra-driver-xsk.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ include "k8s-dra-driver-xsk.fullname" . }}
+  template:
+    metadata:
+      labels:
+        {{- include "k8s-dra-driver-xsk.labels" . | nindent 8 }}
+    spec:
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      serviceAccountName: {{ include "k8s-dra-driver-xsk.fullname" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: driver
+          image: {{ include "k8s-dra-driver-xsk.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /usr/bin/dra-xsk
+          args:
+            - --node-name=$(NODE_NAME)
+            - --driver-name={{ .Values.driverName }}
+            - --backend={{ .Values.backend }}
+            - --handoff-dir=/run/xsk
+            {{- if .Values.includeVirtual }}
+            - --include-virtual
+            {{- end }}
+            {{- if .Values.hsrprp.enabled }}
+            - --hsrprp-config=/etc/xsk-dra/hsrprp.yaml
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            # Always root: the kubelet plugin registration socket
+            # and CDI writes need it (standard node-DRA-driver
+            # posture — see README, Security).
+            runAsUser: {{ .Values.securityContext.runAsUser }}
+            {{- if .Values.securityContext.privileged }}
+            # kind workaround: its containerd ignores capabilities.add
+            # — the minimal-capability posture cannot take effect
+            # there.
+            privileged: true
+            allowPrivilegeEscalation: true
+            {{- else }}
+            # The native backend loads XDP and creates AF_XDP
+            # sockets in-process: CAP_BPF (program/map load) +
+            # CAP_NET_ADMIN (XDP attach) required. CAP_SYS_RESOURCE
+            # is NOT needed on kernels >= 5.11 (BPF memory is
+            # memcg-accounted; the driver's memlock raise is a no-op
+            # there).
+            capabilities:
+              {{- with .Values.securityContext.capabilities.drop }}
+              drop:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              {{- with .Values.securityContext.capabilities.add }}
+              add:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+            allowPrivilegeEscalation: {{ .Values.securityContext.allowPrivilegeEscalation }}
+            readOnlyRootFilesystem: {{ .Values.securityContext.readOnlyRootFilesystem }}
+            {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: plugin-socket-dir
+              mountPath: /var/lib/kubelet/plugins/{{ .Values.driverName }}
+            - name: plugins-registry
+              mountPath: /var/lib/kubelet/plugins_registry
+            - name: cdi-dir
+              mountPath: /etc/cdi
+            - name: handoff-dir
+              mountPath: /run/xsk
+            {{- if eq .Values.backend "bpfman" }}
+            - name: bpfman-runtime
+              mountPath: /run/bpfman
+            - name: bpf-maps
+              mountPath: /run/xsk/bpfman-maps
+            {{- end }}
+            {{- if .Values.hsrprp.enabled }}
+            - name: hsrprp-config
+              mountPath: /etc/xsk-dra
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: plugin-socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/{{ .Values.driverName }}
+            type: DirectoryOrCreate
+        - name: plugins-registry
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: DirectoryOrCreate
+        - name: cdi-dir
+          hostPath:
+            path: /etc/cdi
+            type: DirectoryOrCreate
+        - name: handoff-dir
+          hostPath:
+            path: /run/xsk
+            type: DirectoryOrCreate
+        {{- if eq .Values.backend "bpfman" }}
+        - name: bpfman-runtime
+          hostPath:
+            path: /run/bpfman
+            type: DirectoryOrCreate
+        - name: bpf-maps
+          csi:
+            driver: csi.bpfman.io
+            volumeAttributes:
+              csi.bpfman.io/program: xsk-dra-driver
+              csi.bpfman.io/maps: xsk_map,xsk_ethertypes
+        {{- end }}
+        {{- if .Values.hsrprp.enabled }}
+        - name: hsrprp-config
+          configMap:
+            name: {{ include "k8s-dra-driver-xsk.fullname" . }}-hsrprp
+        {{- end }}
