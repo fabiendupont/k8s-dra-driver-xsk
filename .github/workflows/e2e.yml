@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# HSR/PRP RedBox stream e2e on kind: full DRA chain (stream device
+# pool, claim, NodePrepareResources, CDI injection) plus dataplane
+# verification (RX dedup, ring break, TX tag/clone with path
+# separation). The xdp-hsr-prp BPF objects are built from the
+# published repo during the image build (Dockerfile HSRPRP_REF).
+#
+# Path-filtered (public repo: standard runners are free, but no
+# reason to spend 15 minutes on a README edit) and manually
+# dispatchable.
+
+name: e2e
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pkg/**"
+      - "cmd/**"
+      - "chart/**"
+      - "test/**"
+      - "Dockerfile"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/e2e.yml"
+  pull_request:
+    paths:
+      - "pkg/**"
+      - "cmd/**"
+      - "chart/**"
+      - "test/**"
+      - "Dockerfile"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/e2e.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-hsrprp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install kind, kubectl, helm
+        run: |
+          curl -sfL -o /usr/local/bin/kind \
+            "https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64"
+          curl -sfL -o /usr/local/bin/kubectl \
+            "https://dl.k8s.io/release/v1.34.0/bin/linux/amd64/kubectl"
+          curl -sfL "https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin --strip-components=1 linux-amd64/helm
+          chmod +x /usr/local/bin/kind /usr/local/bin/kubectl
+          kind version && kubectl version --client && helm version --short
+      - name: Run the e2e
+        run: test/e2e-hsrprp.sh xsk-e2e-ci
+      - name: Cleanup
+        if: always()
+        run: kind delete cluster --name xsk-e2e-ci || true

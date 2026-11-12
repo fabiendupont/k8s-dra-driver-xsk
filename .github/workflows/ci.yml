@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI for k8s-dra-driver-xsk: build, unit tests, BPF compile checks,
+# Helm chart lint/render, and the xgl_check integration. The kind
+# e2e lives in e2e.yml (path-filtered + manual dispatch).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -v
+
+  # BPF source compile checks: prove both BPF programs build with a
+  # plain clang (plus libbpf headers). The committed bpf2go objects
+  # are validated structurally by TestEmbeddedSpec in the unit
+  # tests — byte-comparing regenerated objects across toolchains is
+  # not stable, so regeneration stays a developer-machine operation.
+  bpf-compile-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang llvm libbpf-dev >/dev/null
+          # clang -target bpf does not search the multiarch include
+          # dir where the kernel UAPI headers' <asm/types.h> lives.
+          sudo ln -sf x86_64-linux-gnu/asm /usr/include/asm
+      - name: Compile xdp_filter.bpf.c
+        run: |
+          clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+            -c pkg/backend/native/bpf/xdp_filter.bpf.c -o /tmp/filter.o
+          ls -la /tmp/filter.o
+      - name: Compile redbox.bpf.c
+        run: |
+          clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+            -c pkg/hsrprp/bpf/redbox.bpf.c -o /tmp/redbox.o
+          ls -la /tmp/redbox.o
+
+  # Chart hygiene: lint + render every values combination.
+  helm-chart:
+    runs-on: ubuntu-latest
+    container: alpine/helm:3.16.4
+    steps:
+      - uses: actions/checkout@v4
+      - run: helm lint chart/k8s-dra-driver-xsk
+      - run: helm template chart/k8s-dra-driver-xsk > /dev/null
+      - run: helm template chart/k8s-dra-driver-xsk --set backend=bpfman > /dev/null
+      - run: helm template chart/k8s-dra-driver-xsk --set hsrprp.enabled=true > /dev/null
+      - run: |
+          helm template chart/k8s-dra-driver-xsk \
+            --set includeVirtual=true --set securityContext.privileged=true > /dev/null
+      - run: |
+          helm template chart/k8s-dra-driver-xsk \
+            -f test/e2e/values-kind.yaml > /dev/null
+
+  # Unit tests including the cross-repo xgl_check integration: builds
+  # the xgl_check binary straight from xdp-graph-lib sources (the
+  # checker is a standalone C file — no meson/libbpf needed) and runs
+  # pkg/xglcheck tests against it via XGL_CHECK_BIN.
+  xglcheck-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build xgl_check from xdp-graph-lib
+        run: |
+          git clone --depth 1 https://github.com/fabiendupont/xdp-graph-lib.git /tmp/xgl
+          cc -I /tmp/xgl/include -o /usr/local/bin/xgl_check \
+            /tmp/xgl/tools/xgl_check.c /tmp/xgl/src/userspace/xgl_check.c
+      - run: go test ./pkg/xglcheck/ -v
+        env:
+          XGL_CHECK_BIN: /usr/local/bin/xgl_check
