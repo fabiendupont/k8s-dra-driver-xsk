@@ -21,6 +21,13 @@ type Registrar struct {
 	registerapi.UnimplementedRegistrationServer
 	driverName string
 	endpoint   string // path to the DRA plugin socket
+
+	// onRegistered runs after the kubelet confirms registration.
+	// The kubelet deletes all ResourceSlices via DeleteCollection
+	// when IT restarts (its driver-registration state is empty
+	// until drivers re-register), so re-publishing on registration
+	// heals the node's devices.
+	onRegistered func()
 }
 
 // NewRegistrar creates a plugin registrar.
@@ -31,6 +38,12 @@ func NewRegistrar(driverName, endpoint string) *Registrar {
 		driverName: driverName,
 		endpoint:   endpoint,
 	}
+}
+
+// OnRegistered sets the callback invoked after the kubelet confirms
+// (re-)registration of this driver.
+func (r *Registrar) OnRegistered(fn func()) {
+	r.onRegistered = fn
 }
 
 // GetInfo is called by the kubelet plugin watcher to discover the plugin type,
@@ -51,6 +64,9 @@ func (r *Registrar) NotifyRegistrationStatus(ctx context.Context, status *regist
 	if status.PluginRegistered {
 		klog.InfoS("Plugin registered with kubelet successfully",
 			"driver", r.driverName)
+		if r.onRegistered != nil {
+			go r.onRegistered()
+		}
 	} else {
 		klog.ErrorS(nil, "Plugin registration failed",
 			"driver", r.driverName, "error", status.Error)

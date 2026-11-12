@@ -1,0 +1,22 @@
+# HSR/PRP stream claim: allocates the GOOSE stream (0x88B8) of a
+# redundancy group. The pod receives one deduplicated, untagged copy
+# of every frame on its AF_XDP socket; pod TX frames are HSR-tagged
+# and cloned onto both ring ports by the node RedBox.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: hsr-goose-stream
+spec:
+  devices:
+    requests:
+      - name: stream
+        exactly:
+          deviceClassName: hsr-prp-stream
+          count: 1
+          # Optional: constrain to one EtherType (group via
+          # device.attributes["xsk.dra.io"].group).
+          selectors:
+            - cel:
+                expression: >-
+                  'ethertype' in device.attributes["xsk.dra.io"] &&
+                  device.attributes["xsk.dra.io"].ethertype == 0x88B8

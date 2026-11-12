@@ -2,13 +2,17 @@ package driver
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"os"
 
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
+	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/hsrprp"
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/xsk"
 )
 
@@ -20,18 +24,43 @@ type SlicePublisher struct {
 	client     kubernetes.Interface
 	driverName string
 	nodeName   string
+
+	// instanceID identifies this process's slices. Shutdown only
+	// deletes slices it stamped itself: during a rolling update the
+	// old process's graceful Shutdown can race with the replacement
+	// publishing identically-named slices — deleting those would
+	// leave the node with no devices until the next restart.
+	instanceID string
 }
 
 func NewSlicePublisher(client kubernetes.Interface, driverName, nodeName string) *SlicePublisher {
-	return &SlicePublisher{client: client, driverName: driverName, nodeName: nodeName}
+	// Random per-process ID (crypto/rand): survives no state, needs
+	// no API surface. Stamped as an annotation on every slice.
+	var buf [8]byte
+	if _, err := crand.Read(buf[:]); err == nil {
+		return &SlicePublisher{client: client, driverName: driverName,
+			nodeName: nodeName, instanceID: hex.EncodeToString(buf[:])}
+	}
+	return &SlicePublisher{client: client, driverName: driverName,
+		nodeName: nodeName, instanceID: fmt.Sprintf("pid-%d", os.Getpid())}
 }
 
-// PublishSlices discovers NIC queues and creates/updates the node's
-// ResourceSlices. Nodes with more queues than the per-slice device
-// limit (128) — e.g. a many-queue virtio NIC on a large VM — are
-// paginated across multiple slices; all slices share one pool, so
-// the scheduler treats them as a single device set.
+// Discover publishes the node's NIC queues as DRA ResourceSlice devices.
 func (sp *SlicePublisher) PublishSlices(ctx context.Context) error {
+	return sp.publish(ctx, nil)
+}
+
+// PublishHsrPrpSlices publishes the node's HSR/PRP stream devices:
+// one device per redundancy group × EtherType, in a separate pool
+// from the raw queue devices so selectors never mix the two.
+func (sp *SlicePublisher) PublishHsrPrpSlices(ctx context.Context, cfg *hsrprp.Config) error {
+	return sp.publish(ctx, cfg)
+}
+
+// publish creates/updates the node's ResourceSlices. queueCfg nil
+// publishes only queue devices; a non-nil hsr-prp config additionally
+// publishes stream devices in a second pool.
+func (sp *SlicePublisher) publish(ctx context.Context, hsrprpCfg *hsrprp.Config) error {
 	queues, err := xsk.DiscoverQueues()
 	if err != nil {
 		return fmt.Errorf("discovering NIC queues: %w", err)
@@ -51,6 +80,50 @@ func (sp *SlicePublisher) PublishSlices(ctx context.Context) error {
 		}
 		devices = append(devices, dev)
 	}
+
+	if err := sp.publishPool(ctx, devices, sp.sliceName, sp.nodeName); err != nil {
+		return err
+	}
+
+	if hsrprpCfg == nil || len(hsrprpCfg.Groups) == 0 {
+		// Still clean up any leftover stream slices from a previous
+		// run with a config.
+		return sp.deleteOwnSlices(ctx, sp.streamSliceName)
+	}
+
+	streamDevices := make([]resourceapi.Device, 0)
+	for _, g := range hsrprpCfg.Groups {
+		for _, s := range g.Streams {
+			et, err := hsrprp.ParseEthertypeHex(s.Ethertype)
+			if err != nil {
+				return fmt.Errorf("group %q: %w", g.Name, err)
+			}
+			streamDevices = append(streamDevices, resourceapi.Device{
+				// Device name doubles as the CDI id; see
+				// prepareStreamClaim.
+				Name: fmt.Sprintf("%s-%04x", g.Name, et),
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					"type":      {StringValue: stringPtr("hsr-prp-stream")},
+					"group":     {StringValue: stringPtr(g.Name)},
+					"mode":      {StringValue: stringPtr(g.Mode)},
+					"ports":     {StringValue: stringPtr(g.Ports[0] + "," + g.Ports[1])},
+					"ethertype": {IntValue: int64Ptr(int64(et))},
+					// veth-backed delivery: no zerocopy.
+					"zerocopy": {BoolValue: boolPtr(false)},
+				},
+			})
+		}
+	}
+
+	pool := streamPoolName(sp.nodeName)
+	return sp.publishPool(ctx, streamDevices, sp.streamSliceName, pool)
+}
+
+// publishPool creates or updates one pool's slices. Devices are
+// paginated across slices (max 128 each); all slices in a pool share
+// one pool name, so the scheduler treats them as a single device set.
+func (sp *SlicePublisher) publishPool(ctx context.Context, devices []resourceapi.Device,
+	sliceName func(int) string, pool string) error {
 
 	ownerRef, err := sp.nodeOwnerReference(ctx)
 	if err != nil {
@@ -73,14 +146,17 @@ func (sp *SlicePublisher) PublishSlices(ctx context.Context) error {
 
 		slice := &resourceapi.ResourceSlice{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:            sp.sliceName(i),
+				Name:            sliceName(i),
 				OwnerReferences: ownerRef,
+				Annotations: map[string]string{
+					instanceAnnotation: sp.instanceID,
+				},
 			},
 			Spec: resourceapi.ResourceSliceSpec{
 				Driver:   sp.driverName,
 				NodeName: &sp.nodeName,
 				Pool: resourceapi.ResourcePool{
-					Name:               sp.nodeName,
+					Name:               pool,
 					ResourceSliceCount: int64(nSlices),
 				},
 				Devices: devices[lo:hi],
@@ -108,12 +184,20 @@ func (sp *SlicePublisher) PublishSlices(ctx context.Context) error {
 			"devices", hi-lo, "slice", fmt.Sprintf("%d/%d", i+1, nSlices))
 	}
 
-	// Delete slices beyond the current count (queue count shrank).
+	// Delete slices beyond the current count (device count shrank);
+	// never touch a newer instance's slices.
 	for i := nSlices; ; i++ {
-		name := sp.sliceName(i)
+		name := sliceName(i)
+		existing, err := sp.client.ResourceV1().ResourceSlices().Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			break // not found — no more leftovers
+		}
+		if existing.Annotations[instanceAnnotation] != sp.instanceID {
+			break // belongs to a newer process
+		}
 		if err := sp.client.ResourceV1().ResourceSlices().Delete(
 			ctx, name, metav1.DeleteOptions{}); err != nil {
-			break // not found — no more leftovers
+			break
 		}
 		klog.InfoS("Deleted leftover ResourceSlice", "name", name)
 	}
@@ -121,16 +205,42 @@ func (sp *SlicePublisher) PublishSlices(ctx context.Context) error {
 	return nil
 }
 
-// DeleteSlice removes the node's ResourceSlices.
+// instanceAnnotation stamps the publishing process on each slice so
+// a shutting-down process does not delete its replacement's slices.
+const instanceAnnotation = "xsk.dra.io/instance"
+
+// DeleteSlice removes the node's ResourceSlices (both pools), but
+// only those stamped with this process's instance ID — slices from a
+// newer process (rolling update) are left alone.
 func (sp *SlicePublisher) DeleteSlice(ctx context.Context) error {
+	if err := sp.deleteOwnSlices(ctx, sp.sliceName); err != nil {
+		return err
+	}
+	return sp.deleteOwnSlices(ctx, sp.streamSliceName)
+}
+
+// deleteOwnSlices deletes slice 0..n of a pool, stopping at the
+// first slice that belongs to another process (or is already gone).
+func (sp *SlicePublisher) deleteOwnSlices(ctx context.Context, sliceName func(int) string) error {
 	for i := 0; ; i++ {
-		name := sp.sliceName(i)
+		name := sliceName(i)
+		existing, err := sp.client.ResourceV1().ResourceSlices().Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			if i == 0 {
+				// Already gone — nothing to clean up.
+				return nil
+			}
+			break // not found — no more of ours
+		}
+		if existing.Annotations[instanceAnnotation] != sp.instanceID {
+			// A newer process owns this slice now.
+			klog.InfoS("Skipping slice owned by a newer driver instance",
+				"name", name, "owner", existing.Annotations[instanceAnnotation])
+			return nil
+		}
 		if err := sp.client.ResourceV1().ResourceSlices().Delete(
 			ctx, name, metav1.DeleteOptions{}); err != nil {
-			if i == 0 {
-				return fmt.Errorf("deleting ResourceSlice %s: %w", name, err)
-			}
-			break
+			return fmt.Errorf("deleting ResourceSlice %s: %w", name, err)
 		}
 		klog.InfoS("Deleted ResourceSlice", "name", name)
 	}
@@ -142,6 +252,13 @@ func (sp *SlicePublisher) sliceName(i int) string {
 		return fmt.Sprintf("%s-%s", sp.nodeName, sp.driverName)
 	}
 	return fmt.Sprintf("%s-%s-%d", sp.nodeName, sp.driverName, i)
+}
+
+func (sp *SlicePublisher) streamSliceName(i int) string {
+	if i == 0 {
+		return fmt.Sprintf("%s-%s%s", sp.nodeName, sp.driverName, StreamPoolSuffix)
+	}
+	return fmt.Sprintf("%s-%s%s-%d", sp.nodeName, sp.driverName, StreamPoolSuffix, i)
 }
 
 func (sp *SlicePublisher) nodeOwnerReference(ctx context.Context) ([]metav1.OwnerReference, error) {

@@ -29,6 +29,9 @@ type XSK struct {
 
 	fillRing    *ring
 	rxRing      *ring
+	txRing      *ring
+	compRing    *ring
+	txNext      uint32
 	ringOffsets xdpMmapOffsetsT
 }
 
@@ -37,7 +40,9 @@ type XSK struct {
 // 0x100000000, completion ring at 0x180000000.
 const (
 	xdpPgoffRxRing   = 0x0
+	xdpPgoffTxRing   = 0x80000000
 	xdpUgoffFillRing = 0x100000000
+	xdpUgoffCompRing = 0x180000000
 )
 
 // XDP_MMAP_OFFSETS getsockopt option (missing from x/sys/unix).
@@ -151,6 +156,9 @@ func (x *XSK) setup(zerocopy bool) error {
 	if err := setsockoptU32(x.xskFd, unix.XDP_RX_RING, ringSize); err != nil {
 		return fmt.Errorf("XDP_RX_RING: %w", err)
 	}
+	if err := setsockoptU32(x.xskFd, unix.XDP_TX_RING, ringSize); err != nil {
+		return fmt.Errorf("XDP_TX_RING: %w", err)
+	}
 	if err := setsockoptU32(x.xskFd, unix.XDP_UMEM_FILL_RING, ringSize); err != nil {
 		return fmt.Errorf("XDP_UMEM_FILL_RING: %w", err)
 	}
@@ -189,8 +197,14 @@ func (x *XSK) setup(zerocopy bool) error {
 	}
 	x.fillRing = fill
 
-	// Prime: make every frame available to the kernel.
+	// Prime: make frames available for RX. Only the lower half —
+	// the upper half stays free for consumer TX (xsk.Send rotates
+	// through it). Overlapping fill-ring and TX frames makes the
+	// kernel drop TX descriptors (tx_dropped).
 	n := fill.capacity()
+	if n > 1 {
+		n /= 2
+	}
 	for i := uint32(0); i < n; i++ {
 		addr := uint64(uint32(i)) * uint64(x.FrameSize)
 		if !fill.push(&xdpDesc{addr: addr}) {
@@ -368,11 +382,81 @@ func (x *XSK) Refill(addr uint64) {
 	}
 }
 
+// Send transmits one frame from the socket's TX ring. Frames are
+// copied into the upper half of the UMEM (the fill ring primes the
+// lower half for RX), rotating through it; completed frames are
+// reclaimed from the completion ring on the next call.
+//
+// The TX ring is mapped lazily so RX-only consumers (the common
+// case, and everything that inherited the fds before TX support)
+// keep working without it.
+func (x *XSK) Send(frame []byte) error {
+	if int(x.FrameSize) < len(frame) {
+		return fmt.Errorf("frame %d bytes exceeds frame size %d", len(frame), x.FrameSize)
+	}
+	if err := x.ensureTxRings(); err != nil {
+		return err
+	}
+
+	// Reclaim completed frames so the TX ring does not fill up.
+	if x.compRing != nil {
+		x.compRing.cachedCons = atomic.LoadUint32(x.compRing.consumer)
+	}
+
+	// Rotate through the upper half of the UMEM.
+	half := x.NumFrames / 2
+	if half == 0 {
+		half = 1
+	}
+	idx := half + x.txNext%half
+	x.txNext++
+	addr := uint64(idx) * uint64(x.FrameSize)
+	copy(x.umem[addr:addr+uint64(len(frame))], frame)
+
+	if !x.txRing.push(&xdpDesc{addr: addr, len: uint32(len(frame))}) {
+		return fmt.Errorf("tx ring full")
+	}
+	x.txRing.flush(x.xskFd)
+	return nil
+}
+
+// ensureTxRings maps the TX and completion rings on first use.
+func (x *XSK) ensureTxRings() error {
+	if x.txRing != nil {
+		return nil
+	}
+	ringSize := x.NumFrames
+	if ringSize > defaultFillRingSize {
+		ringSize = defaultFillRingSize
+	}
+	tx, err := mapRing(x.xskFd, x.ringOffsets.tx, 16 /* xdp_desc */, ringSize, xdpPgoffTxRing)
+	if err != nil {
+		return fmt.Errorf("mmap tx ring: %w", err)
+	}
+	x.txRing = tx
+	comp, err := mapRing(x.xskFd, x.ringOffsets.comp, 8, ringSize, xdpUgoffCompRing)
+	if err != nil {
+		unix.Munmap(x.txRing.data)
+		x.txRing = nil
+		return fmt.Errorf("mmap completion ring: %w", err)
+	}
+	x.compRing = comp
+	return nil
+}
+
 // Close tears down the socket and UMEM.
 func (x *XSK) Close() {
 	if x.fillRing != nil {
 		unix.Munmap(x.fillRing.data)
 		x.fillRing = nil
+	}
+	if x.txRing != nil {
+		unix.Munmap(x.txRing.data)
+		x.txRing = nil
+	}
+	if x.compRing != nil {
+		unix.Munmap(x.compRing.data)
+		x.compRing = nil
 	}
 	if x.umem != nil {
 		unix.Munmap(x.umem)
@@ -455,4 +539,18 @@ const selinuxContainerFileT = "system_u:object_r:container_file_t:s0"
 func labelForContainers(path string) {
 	_ = unix.Setxattr(path, "security.selinux",
 		[]byte(selinuxContainerFileT+"\x00"), 0)
+}
+
+// RecvFrames returns received frame contents and their UMEM
+// addresses (pass the addresses back to Refill). Exported consumer
+// API for tools that need frame bytes, not strings.
+func (x *XSK) RecvFrames(max int) ([][]byte, []uint64) {
+	descs := x.Recv(max)
+	frames := make([][]byte, 0, len(descs))
+	addrs := make([]uint64, 0, len(descs))
+	for _, d := range descs {
+		frames = append(frames, x.umem[d.addr:d.addr+uint64(d.len)])
+		addrs = append(addrs, d.addr)
+	}
+	return frames, addrs
 }

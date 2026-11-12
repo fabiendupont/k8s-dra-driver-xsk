@@ -20,8 +20,10 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	drav1 "k8s.io/kubelet/pkg/apis/dra/v1"
+	resourceapi "k8s.io/api/resource/v1"
 
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/backend"
+	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/hsrprp"
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/xglcheck"
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/xsk"
 )
@@ -41,12 +43,27 @@ type Driver struct {
 	state        *AllocationState
 	publisher    *SlicePublisher
 	xglCheckBin  string
+	hsrprp       *hsrprp.Manager
+	hsrprpCfg    *hsrprp.Config
+}
+
+// StreamPoolSuffix distinguishes the HSR/PRP stream device pool
+// (logical redundant streams) from the raw queue pool. Claims on the
+// stream pool survive a physical ring port failure; queue claims do
+// not — that is the point of the split.
+const StreamPoolSuffix = "-hsrprp"
+
+// streamPoolName is the DRA pool name for HSR/PRP stream devices.
+func streamPoolName(nodeName string) string {
+	return nodeName + StreamPoolSuffix
 }
 
 // NewDriver creates a new DRA XSK driver instance.
 // xglCheckBin is the path to the xgl_check binary (xdp-graph-lib);
 // empty disables the deterministic validation gate.
-func NewDriver(driverName, nodeName, cdiDir string, b backend.Backend, xglCheckBin string, client kubernetes.Interface) *Driver {
+// hsrprpCfg/hsrprpMgr enable the HSR/PRP RedBox stream pool; nil
+// disables it (only raw queue devices are published).
+func NewDriver(driverName, nodeName, cdiDir string, b backend.Backend, xglCheckBin string, client kubernetes.Interface, hsrprpCfg *hsrprp.Config, hsrprpMgr *hsrprp.Manager) *Driver {
 	return &Driver{
 		driverName:  driverName,
 		nodeName:    nodeName,
@@ -56,12 +73,15 @@ func NewDriver(driverName, nodeName, cdiDir string, b backend.Backend, xglCheckB
 		state:       NewAllocationState(),
 		publisher:   NewSlicePublisher(client, driverName, nodeName),
 		xglCheckBin: xglCheckBin,
+		hsrprp:      hsrprpMgr,
+		hsrprpCfg:   hsrprpCfg,
 	}
 }
 
-// Discover publishes the node's NIC queues as DRA ResourceSlice devices.
+// Discover publishes the node's devices: NIC queues, plus HSR/PRP
+// stream devices when a groups config is loaded.
 func (d *Driver) Discover(ctx context.Context) error {
-	return d.publisher.PublishSlices(ctx)
+	return d.publisher.publish(ctx, d.hsrprpCfg)
 }
 
 // Shutdown removes the ResourceSlice on driver exit.
@@ -90,6 +110,14 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 	}
 	if rc.Status.Allocation == nil {
 		return errResp("ResourceClaim %s/%s has no allocation", claim.Namespace, claim.Name)
+	}
+
+	// HSR/PRP stream claims take a separate path: the device is a
+	// logical redundant stream, not a NIC queue.
+	for _, result := range rc.Status.Allocation.Devices.Results {
+		if result.Pool == streamPoolName(d.nodeName) {
+			return d.prepareStreamClaim(ctx, claim, rc)
+		}
 	}
 
 	allQueues, err := xsk.DiscoverQueues()
@@ -249,6 +277,160 @@ func (d *Driver) prepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.No
 	return &drav1.NodePrepareResourceResponse{Devices: devices}
 }
 
+// prepareStreamClaim wires one HSR/PRP stream claim: per-claim veth
+// plumbing via the RedBox manager, XSK on the veth host side via the
+// (unchanged) backend, and a CDI spec under the stream device name.
+//
+// The RedBox dataplane (ring port XDP dedup + TC tag/clone) is set
+// up once per group; per claim only the delivery map entry, the TX
+// uplink, and the veth pair are created.
+func (d *Driver) prepareStreamClaim(ctx context.Context, claim *drav1.Claim,
+	rc *resourceapi.ResourceClaim) *drav1.NodePrepareResourceResponse {
+
+	if d.hsrprp == nil || d.hsrprpCfg == nil {
+		return errResp("claim %s allocates an HSR/PRP stream but the driver has no hsr-prp config", claim.Uid)
+	}
+
+	// Resolve the stream devices in this claim to (group, ethertype).
+	type streamReq struct {
+		requestName string
+		deviceName  string
+		group       hsrprp.Group
+		ethertype   uint16
+	}
+	var streams []streamReq
+	for _, result := range rc.Status.Allocation.Devices.Results {
+		if result.Driver != d.driverName || result.Pool != streamPoolName(d.nodeName) {
+			continue
+		}
+		var found *streamReq
+		for i := range d.hsrprpCfg.Groups {
+			g := &d.hsrprpCfg.Groups[i]
+			for _, s := range g.Streams {
+				et, err := hsrprp.ParseEthertypeHex(s.Ethertype)
+				if err != nil {
+					return errResp("invalid stream %q in group %q: %v", s.Ethertype, g.Name, err)
+				}
+				if fmt.Sprintf("%s-%04x", g.Name, et) == result.Device {
+					found = &streamReq{requestName: result.Request, deviceName: result.Device, group: *g, ethertype: et}
+					break
+				}
+			}
+			if found != nil {
+				break
+			}
+		}
+		if found == nil {
+			return errResp("unknown stream device %s in claim %s", result.Device, claim.Uid)
+		}
+		streams = append(streams, *found)
+	}
+	if len(streams) == 0 {
+		return errResp("no HSR/PRP stream devices found in claim %s", claim.Uid)
+	}
+
+	// Claim parameters: ethertypes (if given) must be among the
+	// claimed streams; zerocopy/cpu are rejected (veth-backed).
+	// Claims without ethertype parameters are fine — the stream
+	// device itself carries the EtherType, so the legacy
+	// GOOSE+SV preset does not apply here.
+	requestNames := make([]string, 0, len(streams))
+	for _, s := range streams {
+		requestNames = append(requestNames, s.requestName)
+	}
+	params, err := paramsFromClaim(rc, d.driverName, requestNames)
+	if err != nil {
+		return errResp("parsing parameters for claim %s: %v", claim.Uid, err)
+	}
+	_, _, dedicatedCPU, err := params.Resolve()
+	if err != nil {
+		return errResp("invalid parameters for claim %s: %v", claim.Uid, err)
+	}
+	if dedicatedCPU >= 0 {
+		return errResp("stream claims do not support the cpu parameter (claim %s)", claim.Uid)
+	}
+	if len(params.Ethertypes) > 0 {
+		want := make(map[uint16]bool, len(streams))
+		for _, s := range streams {
+			want[s.ethertype] = true
+		}
+		for _, etStr := range params.Ethertypes {
+			et, err := hsrprp.ParseEthertypeHex(etStr)
+			if err != nil {
+				return errResp("invalid ethertype %q in claim %s: %v", etStr, claim.Uid, err)
+			}
+			if !want[et] {
+				return errResp("claim %s filters ethertype %#04x but allocates stream %s",
+					claim.Uid, et, streams[0].deviceName)
+			}
+		}
+	}
+
+	var devices []*drav1.Device
+	for _, s := range streams {
+		// Idempotent group setup (kubelet retries NodePrepare).
+		if err := d.hsrprp.SetupGroup(s.group); err != nil {
+			return errResp("setting up group %s: %v", s.group.Name, err)
+		}
+
+		vethHost, ifindex, err := d.hsrprp.AddStream(claim.Uid, s.group.Name, s.ethertype)
+		if err != nil {
+			return errResp("wiring stream %s: %v", s.deviceName, err)
+		}
+
+		if err := d.state.Allocate(&Allocation{
+			ClaimUID:   claim.Uid,
+			Ifname:     vethHost,
+			QueueID:    0,
+			NQueues:    1,
+			NUMANode:   -1,
+			Ethertypes: []uint16{s.ethertype},
+			Zerocopy:   false,
+			Stream:     true,
+			CDIName:    s.deviceName,
+		}); err != nil {
+			return errResp("allocating stream %s: %v", s.deviceName, err)
+		}
+
+		// The backend creates the XSK on the veth host side and
+		// attaches xdp_xsk_filter there; the RedBox delivery path
+		// feeds deduplicated frames into it.
+		sockPath, err := d.backend.Add(ctx, &backend.Allocation{
+			Ifname:     vethHost,
+			Ifindex:    ifindex,
+			QueueID:    0,
+			Ethertypes: []uint16{s.ethertype},
+			Zerocopy:   false, // veth-backed: no driver zerocopy
+		})
+		if err != nil {
+			d.state.ReleaseByClaimUID(claim.Uid)
+			d.hsrprp.DelStream(claim.Uid)
+			return errResp("allocating XSK for stream %s: %v", s.deviceName, err)
+		}
+
+		if err := WriteCDISpec(d.cdiDir, d.driverName, s.deviceName, vethHost, 0,
+			sockPath, []uint16{s.ethertype}); err != nil {
+			_ = d.backend.Del(ctx, vethHost, 0)
+			d.state.ReleaseByClaimUID(claim.Uid)
+			d.hsrprp.DelStream(claim.Uid)
+			return errResp("writing CDI spec for %s: %v", s.deviceName, err)
+		}
+
+		devices = append(devices, &drav1.Device{
+			RequestNames: []string{s.requestName},
+			PoolName:     streamPoolName(d.nodeName),
+			DeviceName:   s.deviceName,
+			CdiDeviceIds: []string{CDIDeviceID(d.driverName, s.deviceName)},
+		})
+
+		klog.InfoS("Prepared HSR/PRP stream", "claim", claim.Uid,
+			"group", s.group.Name, "ethertype", fmt.Sprintf("%#04x", s.ethertype),
+			"veth", vethHost, "socket", sockPath)
+	}
+
+	return &drav1.NodePrepareResourceResponse{Devices: devices}
+}
+
 // NodeUnprepareResources frees the XSKs and removes CDI specs.
 func (d *Driver) NodeUnprepareResources(ctx context.Context, req *drav1.NodeUnprepareResourcesRequest) (*drav1.NodeUnprepareResourcesResponse, error) {
 	resp := &drav1.NodeUnprepareResourcesResponse{
@@ -267,7 +449,12 @@ func (d *Driver) unprepareClaim(ctx context.Context, claim *drav1.Claim) *drav1.
 		if err := d.backend.Del(ctx, a.Ifname, a.QueueID); err != nil {
 			klog.ErrorS(err, "freeing XSK", "queue", queueKey(a.Ifname, a.QueueID))
 		}
-		RemoveCDISpec(d.cdiDir, d.driverName, queueKey(a.Ifname, a.QueueID))
+		RemoveCDISpec(d.cdiDir, d.driverName, a.cdiID())
+		// Stream claims additionally tear down the RedBox veth
+		// plumbing (delivery map entry, uplink, veth pair).
+		if a.Stream {
+			d.hsrprp.DelStream(claim.Uid)
+		}
 	}
 
 	klog.InfoS("Unprepared XSK claim", "claim", claim.Uid,

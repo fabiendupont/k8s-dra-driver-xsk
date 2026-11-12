@@ -27,6 +27,7 @@ import (
 	bpfmanbackend "github.com/fabiendupont/k8s-dra-driver-xsk/pkg/backend/bpfman"
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/backend/native"
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/driver"
+	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/hsrprp"
 	"github.com/fabiendupont/k8s-dra-driver-xsk/pkg/xsk"
 )
 
@@ -40,6 +41,8 @@ var (
 	includeVirt  = flag.Bool("include-virtual", false, "include virtual interfaces (veth) in queue discovery — development/testing only")
 	registryDir  = flag.String("plugins-registry-dir", "/var/lib/kubelet/plugins_registry", "kubelet plugins_registry directory for the registration socket")
 	backendKind  = flag.String("backend", "native", "XSK backend: native (in-process XDP) or bpfman (delegate program loading to the bpfman eBPF Manager Operator via CRDs)")
+	hsrprpConfig = flag.String("hsrprp-config", "", "HSR/PRP groups config file (YAML); empty disables the RedBox stream pool")
+	hsrprpObjDir = flag.String("hsrprp-obj-dir", "/usr/lib/xsk-dra/hsrprp", "directory containing xdp-hsr-prp BPF objects (node_hsr_ingress.bpf.o, node_hsr_egress.bpf.o)")
 )
 
 func main() {
@@ -97,8 +100,21 @@ func main() {
 		}
 	}
 
+	// HSR/PRP RedBox stream pool: optional. The manager is created
+	// even without a config so stream claims fail with a clear
+	// error rather than a nil deref.
+	var hsrCfg *hsrprp.Config
+	if *hsrprpConfig != "" {
+		hsrCfg, err = hsrprp.LoadConfig(*hsrprpConfig)
+		if err != nil {
+			klog.Fatalf("Loading HSR/PRP config: %v", err)
+		}
+		klog.InfoS("HSR/PRP groups loaded", "groups", len(hsrCfg.Groups))
+	}
+	hsrMgr := hsrprp.NewManager(*hsrprpObjDir)
+
 	d := driver.NewDriver(*driverName, *nodeName, *cdiDir,
-		xskBackend, *xglCheckBin, client)
+		xskBackend, *xglCheckBin, client, hsrCfg, hsrMgr)
 
 	if err := d.Discover(ctx); err != nil {
 		klog.Fatalf("Publishing NIC queue ResourceSlices: %v", err)
@@ -123,6 +139,16 @@ func main() {
 	// socket in plugins_registry; the kubelet watcher discovers it,
 	// calls GetInfo, and dials the DRA endpoint above.
 	registrar := driver.NewRegistrar(*driverName, *pluginSock)
+	// Re-publish slices whenever the kubelet (re-)registers us: the
+	// kubelet deletes all ResourceSlices when it restarts, before
+	// drivers have re-registered.
+	registrar.OnRegistered(func() {
+		if err := d.Discover(ctx); err != nil {
+			klog.ErrorS(err, "Re-publishing ResourceSlices after kubelet registration")
+		} else {
+			klog.InfoS("Re-published ResourceSlices after kubelet registration")
+		}
+	})
 	go func() {
 		if err := registrar.Serve(ctx, *registryDir); err != nil {
 			klog.Errorf("Plugin registration server: %v", err)

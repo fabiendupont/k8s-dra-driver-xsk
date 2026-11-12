@@ -18,6 +18,27 @@ type Allocation struct {
 	IRQ         int // discovered queue IRQ (-1 unknown)
 	CPU         int // dedicated CPU (-1 none)
 	CPUNumaNode int // NUMA node of CPU (-1 unknown)
+
+	// Stream marks an HSR/PRP stream allocation: the XSK sits on a
+	// dedicated per-claim veth behind the RedBox dataplane, not on
+	// a discovered NIC queue. Stream allocations are excluded from
+	// the xgl_check gate (they are the only consumer of their veth
+	// by construction).
+	Stream bool
+
+	// CDIName is the identifier used for the CDI spec file and
+	// device ID. Queue claims use the queue device ID; stream
+	// claims use the stream device name (group-ethertype). Empty
+	// falls back to queueKey(Ifname, QueueID).
+	CDIName string
+}
+
+// cdiID returns the identifier the CDI spec was written under.
+func (a *Allocation) cdiID() string {
+	if a.CDIName != "" {
+		return a.CDIName
+	}
+	return queueKey(a.Ifname, a.QueueID)
 }
 
 // AllocationState tracks which NIC queues are allocated to which ResourceClaims.
