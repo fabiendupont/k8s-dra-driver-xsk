@@ -33,10 +33,8 @@ See `values.yaml` for the full list and comments. The notable ones:
 
 ## Notes
 
-- Resource and device-class names are fixed (not release-prefixed),
-  so the chart is a drop-in replacement for the raw manifests in
-  `deployments/` — those remain available for non-Helm installs but
-  the chart is the primary deployment path.
+- Resource and device-class names are fixed (not release-prefixed):
+  claims, docs and tooling reference them directly.
 - The `driverName` (`xsk.dra.io`) is baked into claim CEL selectors
   and the kubelet plugin socket path; changing it means updating
   claims too.

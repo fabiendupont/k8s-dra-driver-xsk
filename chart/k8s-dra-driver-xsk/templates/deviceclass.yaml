@@ -1,8 +1,8 @@
 {{- $driver := .Values.driverName -}}
 # Generic XSK class: EtherType filters come from the claim's
 # parameters (see deployments/examples/claim-generic.yaml).
-# Names are fixed (matching deployments/device-class.yaml) so claims
-# work identically under the chart and the raw manifests.
+# Names are fixed (referenced directly by claims and docs) so they do
+# not vary with the release.
 apiVersion: resource.k8s.io/v1
 kind: DeviceClass
 metadata:

@@ -48,11 +48,11 @@ equally well.
 # Build and load the image
 docker build -t quay.io/fabiendupont/dra-xsk-driver:latest .
 
-# Device classes (generic + IEC 61850 preset)
-kubectl apply -f deployments/device-class.yaml
+# Label XDP-capable nodes: xsk.dra.io/capable=true
+kubectl label node <node> xsk.dra.io/capable=true
 
-# Driver (labels XDP-capable nodes: xsk.dra.io/capable=true)
-kubectl apply -f deployments/daemonset.yaml
+# Deploy via the Helm chart (the primary install path)
+helm upgrade --install dra-xsk-driver ./chart/k8s-dra-driver-xsk -n kube-system
 
 # Request a queue with explicit filters
 kubectl apply -f deployments/examples/claim-generic.yaml
@@ -122,7 +122,8 @@ BpfApplication CR → bpfman loads program → XDP attached to host
   EtherType filters → CDI → SCM_RIGHTS handoff → consumer
 ```
 
-Deployment requires (see `deployments/bpfman-program.yaml`):
+Deployment requires (see `chart/k8s-dra-driver-xsk/templates/bpfman-program.yaml`,
+rendered with `--set backend=bpfman`):
 1. A `BpfApplication` CR referencing the filter ELF on the shared
    `/run/bpfman` hostPath, with `bpfman.io/ProgramName` metadata
 2. A hostNetwork "netns-target" pod (bpfman's

@@ -68,17 +68,6 @@ fi
 
 # Deploy via the Helm chart (kind values: include-virtual, privileged
 # — kind's containerd ignores capabilities.add —, hsrprp streams).
-if ! helm status dra-xsk-driver -n kube-system >/dev/null 2>&1; then
-    # Migrate from the raw manifests (deployments/) if this cluster
-    # predates the chart: helm refuses to adopt existing resources.
-    $K delete --ignore-not-found -n kube-system \
-        daemonset/dra-xsk-driver serviceaccount/dra-xsk-driver
-    $K delete --ignore-not-found \
-        clusterrole/dra-xsk-driver clusterrolebinding/dra-xsk-driver
-    $K delete --ignore-not-found \
-        deviceclass/xsk deviceclass/xsk-iec61850 deviceclass/hsr-prp-stream
-    $K delete --ignore-not-found -n kube-system configmap/dra-xsk-hsrprp
-fi
 helm upgrade --install dra-xsk-driver "$REPO_ROOT/chart/k8s-dra-driver-xsk" \
     -n kube-system --kube-context "kind-$CLUSTER" \
     -f "$REPO_ROOT/test/e2e/values-kind.yaml" \

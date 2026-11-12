@@ -12,8 +12,8 @@ image:
 # CSI volume map access (deploy the bpfman operator first).
 backend: native
 
-# Resource names are fixed (not release-prefixed) so the chart is a
-# drop-in replacement for the raw manifests in deployments/.
+# Resource names are fixed (not release-prefixed): claims, docs and
+# tooling reference them directly.
 nameOverride: ""
 fullnameOverride: ""
 

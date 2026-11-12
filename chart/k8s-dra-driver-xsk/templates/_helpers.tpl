@@ -1,6 +1,5 @@
-{{/* Fixed names: the chart is a drop-in replacement for the raw
-manifests in deployments/, so resource names must not vary with the
-release name. */}}
+{{/* Fixed names: claims, docs and tooling reference these resources
+directly, so names must not vary with the release name. */}}
 {{- define "k8s-dra-driver-xsk.name" -}}
 {{- default "dra-xsk-driver" .Values.nameOverride -}}
 {{- end -}}
