@@ -25,17 +25,26 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -o /out/dra-xsk ./cmd/driver && \
     CGO_ENABLED=0 go build -trimpath -o /out/hsrbox ./cmd/hsrbox
 
-# xdp-hsr-prp BPF objects (node-local RedBox dataplane). Pinned to a
-# commit for reproducibility; bump deliberately. Trixie (not the Go
+# xdp-hsr-prp BPF objects (node-local RedBox dataplane). Built from
+# the published repository; HSRPRP_REPO/HSRPRP_REF build args allow
+# pinning (reproducible e2e) or pointing at a fork/commit under test
+# (cross-repo validation from xdp-hsr-prp's CI). Trixie (not the Go
 # stage's bookworm) for a meson/clang new enough for the BPF sources;
 # only the .o files are copied out, so the builder distro does not
 # affect the runtime image.
 FROM debian:trixie-slim AS hsrprp
+ARG HSRPRP_REPO=https://github.com/fabiendupont/xdp-hsr-prp
+ARG HSRPRP_REF=main
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         meson ninja-build clang llvm libbpf-dev libxdp-dev pkg-config git ca-certificates && \
     rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 https://github.com/fabiendupont/xdp-hsr-prp /src/xdp-hsr-prp
+RUN git clone --depth 1 --branch "${HSRPRP_REF}" "${HSRPRP_REPO}" /src/xdp-hsr-prp 2>/dev/null || { \
+        # HSRPRP_REF may be a commit SHA (no shallow branch clone):
+        # full clone, then checkout.
+        git clone "${HSRPRP_REPO}" /src/xdp-hsr-prp && \
+        git -C /src/xdp-hsr-prp checkout "${HSRPRP_REF}"; \
+    }
 # clang -target bpf does not search the multiarch include dir where
 # the kernel UAPI headers' <asm/types.h> lives; expose it explicitly.
 RUN ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm

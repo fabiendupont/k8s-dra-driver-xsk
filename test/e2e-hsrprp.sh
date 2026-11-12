@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# test/e2e-hsrprp.sh — HSR/PRP RedBox stream e2e test on the running
-# kind cluster (default: xsk-e2e, created by test/e2e/run.sh).
+# test/e2e-hsrprp.sh — HSR/PRP RedBox stream e2e test on kind.
+#
+# Creates its own cluster unless one with the same name already
+# exists (then reuses it — idempotent re-runs are fast).
 #
 # Topology (all on the worker node):
 #
@@ -24,6 +26,13 @@
 #   5. TX: pod XSK frames -> HSR-tagged clones on both ring port
 #      far ends with distinct path fields
 #
+# The BPF objects under test come from the xdp-hsr-prp revision
+# baked into the image (Dockerfile HSRPRP_REF build arg — override
+# with HSRPRP_REF=... to test a specific commit).
+#
+# Requirements: docker, kind, kubectl, a Docker daemon (CI needs a
+# privileged runner).
+#
 # Usage: test/e2e-hsrprp.sh [cluster-name]     (default: xsk-e2e)
 
 set -euo pipefail
@@ -40,8 +49,35 @@ D="docker exec -i $NODE"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 echo "=== building driver image (with xdp-hsr-prp objects + hsrbox)"
-docker build -q -t "$IMAGE" "$REPO_ROOT" >/dev/null
-kind load docker-image "$IMAGE" --name "$CLUSTER"
+docker build ${HSRPRP_REF:+--build-arg HSRPRP_REF=$HSRPRP_REF} \
+    ${HSRPRP_REPO:+--build-arg HSRPRP_REPO=$HSRPRP_REPO} \
+    -q -t "$IMAGE" "$REPO_ROOT" >/dev/null
+
+if ! kind get clusters 2>/dev/null | grep -q "^$CLUSTER$"; then
+    echo "=== creating kind cluster $CLUSTER"
+    kind create cluster --name "$CLUSTER" --image kindest/node:v1.34.0 \
+        --config "$REPO_ROOT/test/e2e/kind-config.yaml"
+    kind load docker-image "$IMAGE" --name "$CLUSTER"
+    $K wait --for=condition=ready node --all --timeout=120s
+    # Label the worker so the DaemonSet schedules; add the dev-only
+    # --include-virtual flag (kind nodes expose only veths).
+    $K label --overwrite node "$NODE" xsk.dra.io/capable=true
+    $K apply -f "$REPO_ROOT/deployments/rbac.yaml"
+    $K apply -f "$REPO_ROOT/deployments/device-class.yaml"
+    $K apply -f "$REPO_ROOT/deployments/daemonset.yaml"
+    $K -n kube-system set image daemonset/dra-xsk-driver driver="$IMAGE"
+    # Same kind-sandbox caveats as test/e2e/run.sh: capabilities.add
+    # is ignored by this containerd, and :latest defaults to Always.
+    $K -n kube-system patch daemonset dra-xsk-driver --type=json -p='[
+      {"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"},
+      {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--include-virtual"},
+      {"op":"add","path":"/spec/template/spec/containers/0/securityContext/privileged","value":true},
+      {"op":"replace","path":"/spec/template/spec/containers/0/securityContext/allowPrivilegeEscalation","value":true}
+    ]'
+else
+    echo "=== reusing kind cluster $CLUSTER"
+    kind load docker-image "$IMAGE" --name "$CLUSTER"
+fi
 
 echo "=== wiring ring ports on $NODE"
 $D sh -c '
@@ -86,6 +122,18 @@ $K -n kube-system set image daemonset/dra-xsk-driver driver="$IMAGE"
 # rebuilt image actually deploys.
 $K -n kube-system rollout restart daemonset/dra-xsk-driver
 $K -n kube-system rollout status daemonset/dra-xsk-driver --timeout=180s
+
+# Workaround: the kubelet's plugin watcher sometimes fails to pick up
+# the re-created registration socket after a driver pod restart. If
+# the driver is not registered within 60s, restart the kubelet once
+# (its startup re-scan always registers; the driver re-publishes its
+# ResourceSlices on registration, so that path is safe).
+if ! timeout 60 bash -c "until $K -n kube-system logs ds/dra-xsk-driver 2>/dev/null | grep -q 'registered with kubelet successfully'; do sleep 5; done"; then
+    echo "    driver not registered after 60s; restarting kubelet (known kind flake)"
+    $D systemctl restart kubelet
+    timeout 90 bash -c "until $K -n kube-system logs ds/dra-xsk-driver 2>/dev/null | grep -q 'registered with kubelet successfully'; do sleep 5; done" \
+        || fail "driver never registered with the kubelet"
+fi
 
 echo "=== checking stream devices"
 STREAMS=$($K get resourceslices -o json \
