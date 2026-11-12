@@ -107,31 +107,46 @@ The XDP loading layer is pluggable (`--backend`):
 
 - **native** (default): in-process loading via cilium/ebpf — no
   daemon, the driver owns the XDP attach point.
-- **bpfman**: delegates program load/attach/unload to a
-  [bpfman](https://github.com/bpfman/bpfman) daemon (`--bpfman-socket`,
-  default `/run/bpfman/bpfman.sock`). bpfman's dispatcher owns the
-  interface, composing our filter program with other XDP programs;
-  the driver keeps identical DRA semantics, XSK creation, and
-  SCM_RIGHTS handoff (the same embedded ELF, pinned-map updates).
+- **bpfman**: delegates program loading to the [bpfman eBPF
+  Manager Operator](https://github.com/bpfman/bpfman) via its CRD
+  API, and accesses maps through the bpfman CSI driver. Fully
+  validated on OpenShift 4.22 (Single Node OpenShift) with the
+  complete DRA chain.
 
-Complementary rather than competing with bpfman's ecosystem: this
-driver is the DRA-native successor to the device-plugin-based
-AF_XDP pattern, and composes with bpfman where it is already the
-program manager.
+### bpfman backend architecture
 
-**bpfman integration status**: the backend uses the CRD API
-(`BpfApplication`) for program loading, which is the supported
-external interface for the operator-deployed bpfman. Program
-loading works (bpfman assigns a program ID and pins maps under the
-shared `/run/bpfman` hostPath). However, **XDP attachment to host
-network interfaces through the CRD model is currently blocked** by
-an upstream bpfman design limitation: the required
-`networkNamespaces.pods` field only selects pod network namespaces,
-with no host-netns option. Attachment to host NICs requires either
-a manually-deployed bpfman with a host-exposed gRPC socket, or an
-upstream bpfman enhancement to support host-netns attachment in
-the CRD model. The native backend is the recommended and fully
-validated path on OpenShift today.
+```
+BpfApplication CR → bpfman loads program → XDP attached to host
+  interface (via hostNetwork netns-target pod) → CSI volume
+  mounts maps into driver pod → driver inserts XSK fds +
+  EtherType filters → CDI → SCM_RIGHTS handoff → consumer
+```
+
+Deployment requires (see `deployments/bpfman-program.yaml`):
+1. A `BpfApplication` CR referencing the filter ELF on the shared
+   `/run/bpfman` hostPath, with `bpfman.io/ProgramName` metadata
+2. A hostNetwork "netns-target" pod (bpfman's
+   `networkNamespaces.pods` selector resolves to the host netns)
+3. The driver DaemonSet with a CSI ephemeral volume:
+   `csi.bpfman.io/program: xsk-dra-driver`,
+   `csi.bpfman.io/maps: xsk_map,xsk_ethertypes`
+
+The `networkNamespaces.pods` field (required for XDP links) only
+selects pod network namespaces — a hostNetwork pod is used as the
+netns target to attach to host interfaces. The bpfman CSI driver
+re-pins program maps into the driver pod's mount namespace,
+bypassing bpfman's container-local bpffs.
+
+### Comparison
+
+| | native | bpfman |
+|---|---|---|
+| Program loading | in-process (cilium/ebpf) | bpfman operator (CRD) |
+| XDP attach | driver owns attach point | bpfman dispatcher (composes with other programs) |
+| Map access | direct (in-process) | CSI volume (re-pinned maps) |
+| Driver privileges | CAP_BPF + CAP_NET_ADMIN + CAP_NET_RAW + CAP_SYS_RESOURCE | same (XSK creation is in-process) |
+| External dependencies | none | bpfman operator + CSI |
+| Works on | any Kubernetes | requires bpfman operator |
 
 ## Determinism
 
