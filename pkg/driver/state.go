@@ -34,11 +34,18 @@ func NewAllocationState() *AllocationState {
 func (s *AllocationState) Allocate(a *Allocation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.allocated[queueKey(a.Ifname, a.QueueID)]; ok {
+	key := queueKey(a.Ifname, a.QueueID)
+	if existing, ok := s.allocated[key]; ok {
+		// Idempotent: kubelet retries NodePrepareResources on
+		// gRPC timeout. If the SAME claim already holds this
+		// queue, the retry is a no-op.
+		if existing.ClaimUID == a.ClaimUID {
+			return nil
+		}
 		return fmt.Errorf("queue %s already allocated to claim %s",
-			queueKey(a.Ifname, a.QueueID), existing.ClaimUID)
+			key, existing.ClaimUID)
 	}
-	s.allocated[queueKey(a.Ifname, a.QueueID)] = a
+	s.allocated[key] = a
 	return nil
 }
 

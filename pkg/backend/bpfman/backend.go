@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -127,8 +126,9 @@ func (b *Backend) ensureElf() error {
 }
 
 // ensureProgramLoaded waits for the pre-deployed BpfApplication
-// to be loaded by bpfman. The CSI volume in our pod cannot be
-// mounted until this succeeds.
+// to be loaded by bpfman. Checks for a program ID being assigned
+// (more stable than appLoadStatus, which fluctuates during
+// interface updates).
 func (b *Backend) ensureProgramLoaded(ctx context.Context) error {
 	b.appName = "xsk-dra-driver"
 
@@ -149,16 +149,26 @@ func (b *Backend) ensureProgramLoaded(ctx context.Context) error {
 			if node != b.nodeName {
 				continue
 			}
-			status, _, _ := unstructured.NestedString(
-				state.Object, "status", "appLoadStatus")
-			if status == "LoadSuccess" || status == "Loaded" {
-				klog.InfoS("bpfman program loaded",
-					"app", b.appName, "node", node)
-				return nil
-			}
-			if strings.Contains(strings.ToLower(status), "fail") ||
-				strings.Contains(strings.ToLower(status), "error") {
-				return fmt.Errorf("bpfman program load failed: %s", status)
+			// Check for a program ID — assigned once bpfman loads
+			// the program, regardless of attach state.
+			programs, _, _ := unstructured.NestedSlice(
+				state.Object, "status", "programs")
+			for _, p := range programs {
+				prog, ok := p.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				name, _, _ := unstructured.NestedString(prog, "name")
+				if name != programName {
+					continue
+				}
+				progID, _, _ := unstructured.NestedInt64(prog, "programId")
+				if progID > 0 {
+					klog.InfoS("bpfman program loaded",
+						"app", b.appName, "node", node,
+						"programId", progID)
+					return nil
+				}
 			}
 		}
 		time.Sleep(2 * time.Second)
@@ -233,9 +243,53 @@ func (b *Backend) addInterface(ctx context.Context, ifname string) error {
 		return fmt.Errorf("updating BpfApplication interfaces: %w", err)
 	}
 
-	// Wait for the state to reflect the new interface.
-	time.Sleep(5 * time.Second)
-	return nil
+	// Wait for the interface to appear in the BpfApplicationState
+	// with a successful link status.
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		states, err := b.client.Resource(bpfAppStateGVR).Namespace(
+			crdNamespace).List(ctx, metav1.ListOptions{
+			LabelSelector: "bpfman.io/ownedByProgram=xsk-dra-driver",
+		})
+		if err != nil {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		for _, state := range states.Items {
+			node, _, _ := unstructured.NestedString(
+				state.Object, "status", "node")
+			if node != b.nodeName {
+				continue
+			}
+			programs, _, _ := unstructured.NestedSlice(
+				state.Object, "status", "programs")
+			for _, p := range programs {
+				prog, ok := p.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				xdp, _, _ := unstructured.NestedMap(prog, "xdp")
+				links, _, _ := unstructured.NestedSlice(xdp, "links")
+				for _, l := range links {
+					link, ok := l.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					ifName, _, _ := unstructured.NestedString(link, "interfaceName")
+					if ifName == ifname {
+						status, _, _ := unstructured.NestedString(link, "linkStatus")
+						if status == "Attached" || status == "Loaded" {
+							klog.InfoS("bpfman interface attached",
+								"interface", ifname, "status", status)
+							return nil
+						}
+					}
+				}
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("timeout waiting for interface %s to attach", ifname)
 }
 
 // openMap opens one of the program's maps from the CSI-mounted
