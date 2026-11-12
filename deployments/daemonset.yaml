@@ -65,6 +65,8 @@ spec:
               mountPath: /run/xsk
             - name: bpfman-runtime
               mountPath: /run/bpfman
+            - name: bpf-maps
+              mountPath: /run/xsk/bpfman-maps
 
       volumes:
         - name: plugin-socket-dir
@@ -87,3 +89,9 @@ spec:
           hostPath:
             path: /run/bpfman
             type: DirectoryOrCreate
+        - name: bpf-maps
+          csi:
+            driver: csi.bpfman.io
+            volumeAttributes:
+              csi.bpfman.io/program: xsk-dra-driver
+              csi.bpfman.io/maps: xsk_map,xsk_ethertypes

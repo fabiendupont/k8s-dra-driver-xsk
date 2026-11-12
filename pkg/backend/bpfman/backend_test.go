@@ -1,20 +1,18 @@
 package bpfman
 
-import (
-	"testing"
-)
+import "testing"
 
-// TestName verifies the backend name.
-func TestName(t *testing.T) {
-	// New requires a rest.Config which we don't have in unit tests;
-	// just verify the constant.
+func TestConstants(t *testing.T) {
 	if programName != "xdp_xsk_filter" {
 		t.Errorf("programName = %q, want xdp_xsk_filter", programName)
 	}
-	if elfDir != "/run/bpfman" {
-		t.Errorf("elfDir = %q, want /run/bpfman (bpfman operator hostPath)", elfDir)
+	if elfPath != "/run/bpfman/xsk-dra-driver.bpf.o" {
+		t.Errorf("elfPath = %q, want /run/bpfman/xsk-dra-driver.bpf.o", elfPath)
 	}
-	if mapRoot != "/run/bpfman/fs/maps" {
-		t.Errorf("mapRoot = %q, want /run/bpfman/fs/maps", mapRoot)
+	if csiMapDir != "/run/xsk/bpfman-maps" {
+		t.Errorf("csiMapDir = %q, want /run/xsk/bpfman-maps", csiMapDir)
+	}
+	if crdNamespace != "bpfman" {
+		t.Errorf("crdNamespace = %q, want bpfman", crdNamespace)
 	}
 }

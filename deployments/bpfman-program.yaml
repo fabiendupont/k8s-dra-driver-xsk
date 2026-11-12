@@ -1,0 +1,56 @@
+# BpfApplication for the XSK DRA driver's XDP filter program.
+#
+# This is deployed BEFORE the driver DaemonSet so the program is
+# loaded (and its maps are available for CSI mounting) by the time
+# the driver pod's CSI volume is attempted.
+#
+# The metadata label bpfman.io/ProgramName is what the CSI driver
+# uses to find the program when a pod requests map access.
+#
+# NOTE: the ELF path must be writable by the driver and readable
+# by the bpfman agent on the same node. /run/bpfman is the shared
+# hostPath from the bpfman operator's runtime volume. The driver's
+# init container writes the ELF there before this resource is
+# useful; for a fully static deployment, bake the ELF into an OCI
+# image instead.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: xsk-dra-driver-elf
+  namespace: kube-system
+data:
+  # Placeholder — the driver's init container writes the actual ELF
+  # to the shared hostPath. This ConfigMap documents the intent.
+  elf-path: /run/bpfman/xsk-dra-driver.bpf.o
+---
+apiVersion: bpfman.io/v1alpha1
+kind: BpfApplication
+metadata:
+  name: xsk-dra-driver
+  namespace: bpfman
+  labels:
+    app: xsk-dra-driver
+spec:
+  # The ELF is written to the shared /run/bpfman hostPath by the
+  # driver's init container (or baked into an OCI image).
+  byteCode:
+    path: /run/bpfman/xsk-dra-driver.bpf.o
+  nodeSelector:
+    matchExpressions:
+      - key: xsk.dra.io/capable
+        operator: Exists
+  programs:
+    - name: xdp_xsk_filter
+      type: XDP
+      xdp:
+        links:
+          # Interfaces are managed dynamically by the driver;
+          # this initial entry covers the primary interface.
+          # The driver updates this list via the Kubernetes API.
+          - interfaceSelector:
+              primaryNodeInterface: true
+            networkNamespaces:
+              pods:
+                matchLabels:
+                  app: xsk-dra-driver
