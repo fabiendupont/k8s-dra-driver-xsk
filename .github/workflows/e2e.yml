@@ -51,14 +51,16 @@ jobs:
           cache: true
       - name: Install kind, kubectl, helm
         run: |
-          # --retry: runner downloads occasionally hiccup.
-          curl -sfL --retry 3 --retry-delay 2 -o /usr/local/bin/kind \
+          # /usr/local/bin is root-owned on GitHub runners — download
+          # to /tmp, install with sudo (passwordless on hosted
+          # runners). --retry for download hiccups.
+          curl -sfL --retry 3 --retry-delay 2 -o /tmp/kind \
             "https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64"
-          curl -sfL --retry 3 --retry-delay 2 -o /usr/local/bin/kubectl \
+          curl -sfL --retry 3 --retry-delay 2 -o /tmp/kubectl \
             "https://dl.k8s.io/release/v1.34.0/bin/linux/amd64/kubectl"
           curl -sfL --retry 3 --retry-delay 2 "https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz" \
-            | tar -xz -C /usr/local/bin --strip-components=1 linux-amd64/helm
-          chmod +x /usr/local/bin/kind /usr/local/bin/kubectl
+            | tar -xz -C /tmp --strip-components=1 linux-amd64/helm
+          sudo install -m 0755 /tmp/kind /tmp/kubectl /tmp/helm /usr/local/bin/
           kind version && kubectl version --client && helm version --short
       - name: Run the e2e
         run: test/e2e-hsrprp.sh xsk-e2e-ci
