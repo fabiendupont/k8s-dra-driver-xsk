@@ -34,7 +34,7 @@ RUN CGO_ENABLED=0 go build -trimpath -o /out/dra-xsk ./cmd/driver && \
 # affect the runtime image.
 FROM debian:trixie-slim AS hsrprp
 ARG HSRPRP_REPO=https://github.com/fabiendupont/xdp-hsr-prp
-ARG HSRPRP_REF=main
+ARG HSRPRP_REF=v0.1.0
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         meson ninja-build clang llvm libbpf-dev libxdp-dev pkg-config git ca-certificates && \
