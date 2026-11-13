@@ -72,6 +72,12 @@ helm upgrade --install dra-xsk-driver "$REPO_ROOT/chart/k8s-dra-driver-xsk" \
     -n kube-system --kube-context "kind-$CLUSTER" \
     -f "$REPO_ROOT/test/e2e/values-kind.yaml" \
     --set image.tag=e2e --wait --timeout 180s
+# The image tag never changes between runs, so helm sees no template
+# diff — force the rollout so a rebuilt image actually deploys (this
+# also gives the registration check below a fresh pod whose logs are
+# not stale).
+$K -n kube-system rollout restart daemonset/dra-xsk-driver
+$K -n kube-system rollout status daemonset/dra-xsk-driver --timeout=180s
 
 # Workaround: the kubelet's plugin watcher sometimes fails to pick up
 # the re-created registration socket after a driver pod restart. If
@@ -134,7 +140,13 @@ echo "    claim $CLAIM_UID -> veth $VETH, socket /run/xsk/$SOCK"
 # completes, so "Succeeded" is the pass signal.
 consumer_pod() { # name json-args
   local name=$1 args=$2
-  $K delete pod "$name" --ignore-not-found >/dev/null 2>&1
+  # Bounded deletion: a wedged pod must not block the script
+  # (--wait=false + a short grace period, then force).
+  if $K get pod "$name" >/dev/null 2>&1; then
+    $K delete pod "$name" --wait=false --ignore-not-found >/dev/null 2>&1
+    $K wait --for=delete "pod/$name" --timeout=30s >/dev/null 2>&1 || \
+      $K delete pod "$name" --force --grace-period=0 --ignore-not-found >/dev/null 2>&1
+  fi
   $K apply -f - <<EOF
 apiVersion: v1
 kind: Pod
