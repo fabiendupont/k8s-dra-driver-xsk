@@ -20,7 +20,6 @@ const (
 	redboxMapRbStreams       = "rb_streams"
 	redboxMapRbUplinkIfindex = "rb_uplink_ifindex"
 	redboxProgRbDelivery     = "rb_delivery"
-	redboxProgRbEthInput     = "rb_eth_input"
 	redboxProgRbUplink       = "rb_uplink"
 	redboxProgRedboxRoot     = "redbox_root"
 )
@@ -68,7 +67,6 @@ type redboxSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type redboxProgramSpecs struct {
 	RbDelivery *ebpf.ProgramSpec `ebpf:"rb_delivery"`
-	RbEthInput *ebpf.ProgramSpec `ebpf:"rb_eth_input"`
 	RbUplink   *ebpf.ProgramSpec `ebpf:"rb_uplink"`
 	RedboxRoot *ebpf.ProgramSpec `ebpf:"redbox_root"`
 }
@@ -132,7 +130,6 @@ type redboxVariables struct {
 // It can be passed to loadRedboxObjects or ebpf.CollectionSpec.LoadAndAssign.
 type redboxPrograms struct {
 	RbDelivery *ebpf.Program `ebpf:"rb_delivery"`
-	RbEthInput *ebpf.Program `ebpf:"rb_eth_input"`
 	RbUplink   *ebpf.Program `ebpf:"rb_uplink"`
 	RedboxRoot *ebpf.Program `ebpf:"redbox_root"`
 }
@@ -140,7 +137,6 @@ type redboxPrograms struct {
 func (p *redboxPrograms) Close() error {
 	return _RedboxClose(
 		p.RbDelivery,
-		p.RbEthInput,
 		p.RbUplink,
 		p.RedboxRoot,
 	)

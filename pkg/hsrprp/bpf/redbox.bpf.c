@@ -7,8 +7,10 @@
  * network namespace):
  *
  *   RX:  ring port XDP
- *          redbox_root (alloc xgl_meta) -> rb_eth_input
- *          rb_eth_input: EtherType 0x892F -> node_hsr_ingress
+ *          redbox_root (alloc xgl_meta) -> node_eth_dispatch
+ *                        (generic L2 dispatch, from xdp-nodes —
+ *                         replaces this repo's own eth-input shim)
+ *          xnodes_l2_table[0x892F] -> node_hsr_ingress
  *                        (dedup + tag strip, from xdp-hsr-prp)
  *          node_hsr_ingress re-enters via egl_prog_array[ETH_INPUT]
  *          -> rb_delivery: EtherType -> claim veth peer, bpf_redirect
@@ -54,11 +56,14 @@ struct rb_xgl_meta {
 _Static_assert(sizeof(struct rb_xgl_meta) == 52,
 	       "rb_xgl_meta must match xgl_meta (52 bytes)");
 
-/* Tail-call indices within rb_pa. */
-#define RB_IDX_ETH_INPUT   0
-#define RB_IDX_HSR_INGRESS 1
+/* The root tail-calls xdp-nodes' node_eth_dispatch, which lives in
+ * its own object; index 0 per the xnodes registry (XNODE_IDX_XGL
+ * base — the root is the composition's dispatch entry point). The
+ * HSR ingress node is reached via the xnodes object's own
+ * egl_prog_array, keyed by xnodes_l2_table (populated from Go),
+ * so rb_pa carries only the root's single tail-call target. */
+#define RB_IDX_ETH_DISPATCH 0
 
-/* PROG_ARRAY: [0]=rb_eth_input, [1]=node_hsr_ingress (foreign fd). */
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
 	__uint(max_entries, 8);
@@ -82,10 +87,6 @@ struct {
 	__type(value, __u32);
 } rb_uplink_ifindex SEC(".maps");
 
-/* HSR EtherType (IEC 62439-3). PRP is untagged at L2 and dispatched
- * per-port instead; the PRP prototype will key rb_pa differently. */
-#define RB_HSR_ETHERTYPE 0x892F
-
 SEC("xdp")
 int redbox_root(struct xdp_md *ctx)
 {
@@ -103,29 +104,13 @@ int redbox_root(struct xdp_md *ctx)
 	meta->version = RB_XGL_META_VERSION;
 	meta->ingress_ifindex = ctx->ingress_ifindex;
 	meta->timestamp_ns = bpf_ktime_get_ns();
-	meta->next_node = RB_IDX_ETH_INPUT;
+	meta->next_node = RB_IDX_ETH_DISPATCH;
 
-	bpf_tail_call(ctx, &rb_pa, RB_IDX_ETH_INPUT);
-	return XDP_PASS;
-}
-
-SEC("xdp")
-int rb_eth_input(struct xdp_md *ctx)
-{
-	void *data = (void *)(long)ctx->data;
-	void *data_end = (void *)(long)ctx->data_end;
-	struct ethhdr *eth = data;
-	__u16 ethertype;
-
-	if (data + sizeof(*eth) > data_end)
-		return XDP_PASS;
-
-	ethertype = bpf_ntohs(eth->h_proto);
-	if (ethertype == RB_HSR_ETHERTYPE) {
-		bpf_tail_call(ctx, &rb_pa, RB_IDX_HSR_INGRESS);
-		return XDP_PASS;
-	}
-
+	/* Tail-call into xdp-nodes' node_eth_dispatch (foreign fd,
+	 * installed by the Go manager): EtherType-driven L2 dispatch
+	 * via xnodes_l2_table, with 0x892F routed to the HSR ingress
+	 * node. */
+	bpf_tail_call(ctx, &rb_pa, RB_IDX_ETH_DISPATCH);
 	return XDP_PASS;
 }
 

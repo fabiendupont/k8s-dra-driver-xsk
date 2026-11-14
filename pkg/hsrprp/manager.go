@@ -18,12 +18,18 @@ const (
 	roleHSRIngress = 1 // self index of node_hsr_ingress (stats)
 )
 
-// rbEthInputIdx is the PROG_ARRAY index inside the *hsr object's*
-// egl_prog_array where rb_delivery is installed. 10 is arbitrary but
-// must not collide with indices the hsr object itself uses; the
-// prototype owns the whole graph, so 0..1 (rb_pa) plus this are the
-// only live indices.
-const ethInputDeliveryIdx = 10
+// Composition indices per the xnodes registry (xdp-nodes
+// include/xnodes/xnodes_registry.h). The HSR ingress node is
+// installed in the xnodes object's egl_prog_array at the
+// XNODE_IDX_HSR_PRP base (64); rb_delivery stays in the hsr
+// object's own egl_prog_array at a scratch index inside the
+// reserved dynamic range.
+const (
+	xnodesIdxHSRIngress = 64  // XNODE_IDX_HSR_PRP_BASE
+	deliveryIdx         = 160 // XNODE_IDX_DYNAMIC_FIRST
+	// xnodes_node_config roles (xdp-nodes registry).
+	xnodesRoleEthDispatch = 0
+)
 
 // Manager owns the node-local RedBox dataplane for the configured
 // groups: the XDP root/dispatch shims, the xdp-hsr-prp ingress node,
@@ -46,6 +52,7 @@ type groupState struct {
 	egress    *ebpf.Collection // node_hsr_egress (+ tc_ring_config, seq_counters)
 	rootLinks []link.Link      // XDP links on the two ring ports
 	egLinks   []link.Link      // TC egress links on the two ring ports
+	xnodes    *ebpf.Collection // xdp-nodes generic nodes (eth dispatch)
 	portIdx   [2]int           // ring port ifindexes at attach time
 }
 
@@ -143,29 +150,55 @@ func (m *Manager) SetupGroup(cfg Group) error {
 		return fmt.Errorf("group %q: loading egress: %w", cfg.Name, err)
 	}
 
-	gs := &groupState{cfg: cfg, rb: rb, ingress: ingress, egress: egress,
+	// Load node_eth_dispatch (xdp-nodes): generic L2 dispatch that
+	// replaces this repo's former rb_eth_input shim.
+	xnSpec, err := ebpf.LoadCollectionSpec(m.objDir + "/node_eth_dispatch.bpf.o")
+	if err != nil {
+		rb.Close(); ingress.Close(); egress.Close()
+		return fmt.Errorf("group %q: opening xnodes eth_dispatch spec: %w", cfg.Name, err)
+	}
+	xnodes, err := ebpf.NewCollection(xnSpec)
+	if err != nil {
+		rb.Close(); ingress.Close(); egress.Close()
+		return fmt.Errorf("group %q: loading xnodes eth_dispatch: %w", cfg.Name, err)
+	}
+
+	gs := &groupState{cfg: cfg, rb: rb, ingress: ingress, egress: egress, xnodes: xnodes,
 		portIdx: [2]int{portA.Attrs().Index, portB.Attrs().Index}}
 	attach := func() error {
-		// rb_pa[0] = rb_eth_input (same object).
+		// rb_pa[0] = node_eth_dispatch (xdp-nodes, foreign fd) —
+		// the root's single tail-call target.
 		pa := rb.Maps["rb_pa"]
-		if err := pa.Put(uint32(0), uint32(rb.Programs["rb_eth_input"].FD())); err != nil {
-			return fmt.Errorf("populating rb_pa[eth_input]: %w", err)
+		if err := pa.Put(uint32(0), uint32(xnodes.Programs["node_eth_dispatch"].FD())); err != nil {
+			return fmt.Errorf("populating rb_pa[eth_dispatch]: %w", err)
 		}
-		// rb_pa[1] = node_hsr_ingress (foreign program fd).
-		if err := pa.Put(uint32(1), uint32(ingress.Programs["node_hsr_ingress"].FD())); err != nil {
-			return fmt.Errorf("populating rb_pa[hsr_ingress]: %w", err)
+		// xnodes composition: L2 table routes 0x892F to the HSR
+		// ingress node, installed in the xnodes object's own
+		// prog array; the node's config map carries its self
+		// index for statistics.
+		xnPa := xnodes.Maps["egl_prog_array"]
+		if err := xnPa.Put(uint32(xnodesIdxHSRIngress), uint32(ingress.Programs["node_hsr_ingress"].FD())); err != nil {
+			return fmt.Errorf("populating xnodes egl_prog_array[hsr_ingress]: %w", err)
+		}
+		l2t := xnodes.Maps["xnodes_l2_table"]
+		if err := l2t.Put(uint16(0x892F), uint32(xnodesIdxHSRIngress)); err != nil {
+			return fmt.Errorf("populating xnodes_l2_table[0x892F]: %w", err)
+		}
+		xnCfg := xnodes.Maps["xnodes_node_config"]
+		if err := xnCfg.Put(uint32(xnodesRoleEthDispatch), uint32(32)); err != nil {
+			return fmt.Errorf("populating xnodes_node_config[eth_dispatch]: %w", err)
 		}
 		// hsr_prp_node_config: self index for stats + delivery index.
 		nc := ingress.Maps["hsr_prp_node_config"]
-		if err := nc.Put(uint32(roleHSRIngress), uint32(1)); err != nil {
+		if err := nc.Put(uint32(roleHSRIngress), uint32(xnodesIdxHSRIngress)); err != nil {
 			return fmt.Errorf("populating node_config[hsr_ingress]: %w", err)
 		}
-		if err := nc.Put(uint32(roleEthInput), uint32(ethInputDeliveryIdx)); err != nil {
+		if err := nc.Put(uint32(roleEthInput), uint32(deliveryIdx)); err != nil {
 			return fmt.Errorf("populating node_config[eth_input]: %w", err)
 		}
-		// egl_prog_array[ethInputDeliveryIdx] = rb_delivery.
+		// hsr egl_prog_array[deliveryIdx] = rb_delivery.
 		egl := ingress.Maps["egl_prog_array"]
-		if err := egl.Put(uint32(ethInputDeliveryIdx), uint32(rb.Programs["rb_delivery"].FD())); err != nil {
+		if err := egl.Put(uint32(deliveryIdx), uint32(rb.Programs["rb_delivery"].FD())); err != nil {
 			return fmt.Errorf("populating egl_prog_array[delivery]: %w", err)
 		}
 
@@ -254,6 +287,9 @@ func (gs *groupState) close() {
 	gs.rb.Close()
 	gs.ingress.Close()
 	gs.egress.Close()
+	if gs.xnodes != nil {
+		gs.xnodes.Close()
+	}
 }
 
 // linksAlive reports whether the ring ports still carry our XDP

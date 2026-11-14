@@ -35,6 +35,8 @@ RUN CGO_ENABLED=0 go build -trimpath -o /out/dra-xsk ./cmd/driver && \
 FROM debian:trixie-slim AS hsrprp
 ARG HSRPRP_REPO=https://github.com/fabiendupont/xdp-hsr-prp
 ARG HSRPRP_REF=v0.1.0
+ARG XNODES_REPO=https://github.com/fabiendupont/xdp-nodes
+ARG XNODES_REF=main
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         meson ninja-build clang llvm libbpf-dev libxdp-dev pkg-config git ca-certificates && \
@@ -45,6 +47,11 @@ RUN git clone --depth 1 --branch "${HSRPRP_REF}" "${HSRPRP_REPO}" /src/xdp-hsr-p
         git clone "${HSRPRP_REPO}" /src/xdp-hsr-prp && \
         git -C /src/xdp-hsr-prp checkout "${HSRPRP_REF}"; \
     }
+# xdp-nodes: generic L2–L4 nodes (the RedBox eth dispatch).
+RUN git clone --depth 1 --branch "${XNODES_REF}" "${XNODES_REPO}" /src/xdp-nodes 2>/dev/null || { \
+        git clone "${XNODES_REPO}" /src/xdp-nodes && \
+        git -C /src/xdp-nodes checkout "${XNODES_REF}"; \
+    }
 # clang -target bpf does not search the multiarch include dir where
 # the kernel UAPI headers' <asm/types.h> lives; expose it explicitly.
 RUN ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/asm
@@ -53,6 +60,10 @@ RUN meson setup builddir . && \
     ninja -C builddir node_hsr_ingress.bpf.o node_hsr_egress.bpf.o && \
     mkdir -p /out/hsrprp && \
     cp builddir/node_hsr_ingress.bpf.o builddir/node_hsr_egress.bpf.o /out/hsrprp/
+WORKDIR /src/xdp-nodes
+RUN meson setup builddir . && \
+    ninja -C builddir node_eth_dispatch.bpf.o && \
+    cp builddir/node_eth_dispatch.bpf.o /out/hsrprp/
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/dra-xsk /usr/bin/dra-xsk
