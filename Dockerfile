@@ -36,7 +36,7 @@ FROM debian:trixie-slim AS hsrprp
 ARG HSRPRP_REPO=https://github.com/fabiendupont/xdp-hsr-prp
 ARG HSRPRP_REF=v0.1.0
 ARG XNODES_REPO=https://github.com/fabiendupont/xdp-nodes
-ARG XNODES_REF=main
+ARG XNODES_REF=v0.1.0
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         meson ninja-build clang llvm libbpf-dev libxdp-dev pkg-config git ca-certificates && \
